@@ -1,4 +1,4 @@
-"""Audio helpers: trim_silence, encode_ogg, prepare_audio, is_audio_silent, persistent stream."""
+"""Audio helpers: silence detection (RMS), trim, OGG encode, text chunking."""
 from __future__ import annotations
 
 import io
@@ -12,22 +12,17 @@ from .config import log, SAMPLE_RATE, SILENCE_THRESHOLD, RMS_THRESHOLD, TTS_CHUN
 
 
 def is_audio_silent(audio: np.ndarray, rms_threshold: float = RMS_THRESHOLD) -> bool:
-    """Detect if audio is below noise floor -- prevents Whisper hallucination."""
+    """Detect if audio is below noise floor to prevent Whisper hallucination."""
     if len(audio) == 0:
         return True
     rms = float(np.sqrt(np.mean(audio ** 2)))
     above = float(np.mean(np.abs(audio) > rms_threshold))
     is_silent = rms < rms_threshold or above < 0.1
-    log.debug(
-        "[ENERGY] RMS=%.4f, above_threshold=%.1f%%, silent=%s",
-        rms, above * 100, is_silent,
-    )
+    log.debug("[ENERGY] RMS=%.4f above=%.1f%% silent=%s", rms, above * 100, is_silent)
     return is_silent
 
 
-def trim_silence(
-    audio: np.ndarray, threshold: float = SILENCE_THRESHOLD,
-) -> np.ndarray:
+def trim_silence(audio: np.ndarray, threshold: float = SILENCE_THRESHOLD) -> np.ndarray:
     """Trim leading and trailing silence from audio."""
     abs_audio = np.abs(audio).flatten()
     above = np.where(abs_audio > threshold)[0]
@@ -36,14 +31,14 @@ def trim_silence(
     start, end = above[0], above[-1] + 1
     trimmed = audio[start:end]
     log.debug(
-        "[trim] %d -> %d samples (removed %.1fs silence)",
+        "[trim] %d -> %d samples (removed %.1fs)",
         len(audio), len(trimmed), (len(audio) - len(trimmed)) / SAMPLE_RATE,
     )
     return trimmed
 
 
 def encode_ogg(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
-    """Encode audio to OGG/Vorbis in memory -- much smaller than WAV."""
+    """Encode audio to OGG/Vorbis in memory."""
     buf = io.BytesIO()
     sf.write(buf, audio, sample_rate, format="OGG", subtype="VORBIS")
     return buf.getvalue()
@@ -52,23 +47,19 @@ def encode_ogg(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
 def prepare_audio_for_whisper(
     audio_frames: list[np.ndarray],
 ) -> tuple[bytes, str, float]:
-    """Concatenate frames, trim silence, encode to OGG.
-
-    Returns (bytes, mime, duration).
-    """
+    """Concat frames, trim silence, encode to OGG. Returns (bytes, mime, duration)."""
     t0 = time.time()
     audio = np.concatenate(audio_frames, axis=0)
-    raw_duration = len(audio) / SAMPLE_RATE
+    raw_dur = len(audio) / SAMPLE_RATE
     audio = trim_silence(audio)
-    trimmed_duration = len(audio) / SAMPLE_RATE
-    audio_int16 = (audio * 32767).astype(np.int16)
-    ogg_bytes = encode_ogg(audio_int16)
-    prep_time = time.time() - t0
+    trim_dur = len(audio) / SAMPLE_RATE
+    audio_i16 = (audio * 32767).astype(np.int16)
+    ogg = encode_ogg(audio_i16)
     log.info(
-        "[prep] %.1fs audio (trimmed from %.1fs) -> %d bytes OGG in %.3fs",
-        trimmed_duration, raw_duration, len(ogg_bytes), prep_time,
+        "[prep] %.1fs (trimmed from %.1fs) -> %d bytes OGG in %.3fs",
+        trim_dur, raw_dur, len(ogg), time.time() - t0,
     )
-    return ogg_bytes, "audio/ogg", trimmed_duration
+    return ogg, "audio/ogg", trim_dur
 
 
 def split_text_chunks(text: str, max_chars: int = TTS_CHUNK_SIZE) -> list[str]:
@@ -83,8 +74,8 @@ def split_text_chunks(text: str, max_chars: int = TTS_CHUNK_SIZE) -> list[str]:
             break
         segment = remaining[:max_chars]
         split_at = -1
-        for pattern in [r"[.!?]\s", r"\n", r",\s"]:
-            matches = list(re.finditer(pattern, segment))
+        for pat in [r"[.!?]\s", r"\n", r",\s"]:
+            matches = list(re.finditer(pat, segment))
             if matches:
                 split_at = matches[-1].end()
                 break

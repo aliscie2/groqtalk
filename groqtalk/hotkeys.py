@@ -1,13 +1,14 @@
-"""Carbon global hotkey registration (ctypes Carbon bindings)."""
+"""Carbon global hotkey registration via ctypes (no Accessibility needed)."""
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+from typing import Callable
 
 from .config import log
 
 # ---------------------------------------------------------------------------
-# Carbon global hotkeys -- NO Accessibility permission required
+# Carbon library
 # ---------------------------------------------------------------------------
 _carbon = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Carbon"))
 
@@ -21,9 +22,10 @@ class _EventTypeSpec(ctypes.Structure):
 
 
 _EventHandlerProcPtr = ctypes.CFUNCTYPE(
-    ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+    ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
 )
 
+# Function signatures
 _carbon.GetApplicationEventTarget.argtypes = []
 _carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
 
@@ -49,12 +51,14 @@ _carbon.GetEventParameter.argtypes = [
 ]
 _carbon.GetEventParameter.restype = ctypes.c_int32
 
-_kEventClassKeyboard = 0x6B657962
-_kEventHotKeyPressed = 5
-_kEventParamDirectObject = 0x2D2D2D2D
-_typeEventHotKeyID = 0x686B6964
+# Constants
+_kEventClassKeyboard: int = 0x6B657962
+_kEventHotKeyPressed: int = 5
+_kEventParamDirectObject: int = 0x2D2D2D2D
+_typeEventHotKeyID: int = 0x686B6964
 
-_hotkey_callbacks: dict[int, callable] = {}
+# State
+_hotkey_callbacks: dict[int, Callable] = {}
 _hotkey_refs: list[ctypes.c_void_p] = []
 _carbon_handler_ref = ctypes.c_void_p()
 
@@ -65,6 +69,7 @@ def _carbon_hotkey_callback(
     event: ctypes.c_void_p,
     user_data: ctypes.c_void_p,
 ) -> int:
+    """Callback invoked by Carbon when a registered hotkey fires."""
     try:
         hk_id = _EventHotKeyID()
         _carbon.GetEventParameter(
@@ -81,12 +86,12 @@ def _carbon_hotkey_callback(
 
 def install_carbon_hotkey_handler() -> None:
     """Install the Carbon event handler for hotkey events."""
-    event_type = _EventTypeSpec(
+    spec = _EventTypeSpec(
         eventClass=_kEventClassKeyboard, eventKind=_kEventHotKeyPressed,
     )
     status = _carbon.InstallEventHandler(
         _carbon.GetApplicationEventTarget(), _carbon_hotkey_callback,
-        1, ctypes.byref(event_type), None, ctypes.byref(_carbon_handler_ref),
+        1, ctypes.byref(spec), None, ctypes.byref(_carbon_handler_ref),
     )
     if status != 0:
         log.error("InstallEventHandler failed: %d", status)
@@ -95,7 +100,7 @@ def install_carbon_hotkey_handler() -> None:
 
 
 def register_hotkey(
-    key_code: int, modifiers: int, hotkey_id: int, callback: callable,
+    key_code: int, modifiers: int, hotkey_id: int, callback: Callable,
 ) -> None:
     """Register a single global hotkey with a callback."""
     _hotkey_callbacks[hotkey_id] = callback

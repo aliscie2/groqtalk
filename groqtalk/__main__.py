@@ -10,7 +10,9 @@ from .app import GroqTalkApp
 def main() -> None:
     """Launch GroqTalk with signal handling."""
     def _on_signal(signum: int, frame: object) -> None:
-        log.warning("[EXIT] received signal %d (%s)", signum, signal.Signals(signum).name)
+        log.warning(
+            "[EXIT] received signal %d (%s)", signum, signal.Signals(signum).name,
+        )
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGHUP, _on_signal)

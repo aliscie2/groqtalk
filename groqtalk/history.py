@@ -1,4 +1,4 @@
-"""History load/save/prune/add, TTS cache, relative_time, usage tracking + cost."""
+"""Usage tracking, cost estimation, history CRUD, TTS cache, relative_time."""
 from __future__ import annotations
 
 import json
@@ -10,13 +10,15 @@ from .config import log, HISTORY_DIR, HISTORY_MAX
 # ---------------------------------------------------------------------------
 # Usage tracking -- local cost estimator
 # ---------------------------------------------------------------------------
-_USAGE_FILE = os.path.join(os.path.expanduser("~"), ".config", "groqtalk", "usage.json")
+_USAGE_FILE = os.path.join(
+    os.path.expanduser("~"), ".config", "groqtalk", "usage.json",
+)
 
-# Groq pricing (from groq.com/pricing, March 2025)
-_PRICE_WHISPER_PER_SEC = 0.04 / 3600
-_PRICE_LLM_INPUT_PER_TOKEN = 0.59 / 1e6
-_PRICE_LLM_OUTPUT_PER_TOKEN = 0.79 / 1e6
-_PRICE_TTS_PER_CHAR = 22.00 / 1e6
+# Groq pricing (March 2025)
+_PRICE_WHISPER_PER_SEC: float = 0.04 / 3600
+_PRICE_LLM_INPUT_PER_TOKEN: float = 0.59 / 1e6
+_PRICE_LLM_OUTPUT_PER_TOKEN: float = 0.79 / 1e6
+_PRICE_TTS_PER_CHAR: float = 22.00 / 1e6
 
 
 def _load_usage() -> list[dict]:
@@ -35,8 +37,7 @@ def _save_usage(entries: list[dict]) -> None:
 def log_usage(kind: str, **kwargs: float | int) -> None:
     """Log a usage event with timestamp."""
     entries = _load_usage()
-    entry = {"ts": datetime.now().isoformat(), "kind": kind, **kwargs}
-    entries.append(entry)
+    entries.append({"ts": datetime.now().isoformat(), "kind": kind, **kwargs})
     _save_usage(entries)
 
 
@@ -79,7 +80,7 @@ _HISTORY_INDEX = os.path.join(HISTORY_DIR, "index.json")
 
 
 def load_history() -> list[dict]:
-    """Load history index."""
+    """Load history index from disk."""
     try:
         with open(_HISTORY_INDEX, "r") as f:
             return json.load(f)
@@ -106,7 +107,9 @@ def _prune_history(entries: list[dict]) -> list[dict]:
     return entries[-HISTORY_MAX:]
 
 
-def add_history_entry(wav_bytes: bytes, transcript: str, cleaned: str) -> dict:
+def add_history_entry(
+    wav_bytes: bytes, transcript: str, cleaned: str,
+) -> dict:
     """Save a recording to history and return the entry."""
     entries = load_history()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -135,7 +138,7 @@ def save_tts_to_history(text: str, tts_wav_bytes: bytes) -> None:
                 f.write(tts_wav_bytes)
             e["tts_wav"] = tts_path
             _save_history(entries)
-            log.info("[HISTORY] saved TTS for entry %s (%d bytes)", ts, len(tts_wav_bytes))
+            log.info("[HISTORY] saved TTS for %s (%d bytes)", ts, len(tts_wav_bytes))
             return
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tts_path = os.path.join(HISTORY_DIR, f"tts_{ts}.wav")
@@ -145,11 +148,11 @@ def save_tts_to_history(text: str, tts_wav_bytes: bytes) -> None:
     entries.append(entry)
     entries = _prune_history(entries)
     _save_history(entries)
-    log.info("[HISTORY] saved standalone TTS entry %s (%d bytes)", ts, len(tts_wav_bytes))
+    log.info("[HISTORY] saved standalone TTS %s (%d bytes)", ts, len(tts_wav_bytes))
 
 
 def find_cached_tts(text: str) -> bytes | None:
-    """Check if we already have TTS audio for this text."""
+    """Return cached TTS WAV bytes if available."""
     entries = load_history()
     for e in reversed(entries):
         if e.get("cleaned", "").strip() == text.strip() and e.get("tts_wav"):
@@ -157,23 +160,22 @@ def find_cached_tts(text: str) -> bytes | None:
             if os.path.exists(path):
                 with open(path, "rb") as f:
                     data = f.read()
-                log.info("[HISTORY] TTS cache hit for %s (%d bytes)", e["ts"], len(data))
+                log.info("[HISTORY] TTS cache hit %s (%d bytes)", e["ts"], len(data))
                 return data
     return None
 
 
 def relative_time(ts_str: str) -> str:
-    """Convert timestamp string like '20260329_174547' to '5m ago'."""
+    """Convert '20260329_174547' to '5m ago'."""
     try:
         ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
-        delta = datetime.now() - ts
-        seconds = int(delta.total_seconds())
-        if seconds < 60:
+        secs = int((datetime.now() - ts).total_seconds())
+        if secs < 60:
             return "just now"
-        if seconds < 3600:
-            return f"{seconds // 60}m ago"
-        if seconds < 86400:
-            return f"{seconds // 3600}h ago"
-        return f"{seconds // 86400}d ago"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
     except (ValueError, TypeError):
         return ts_str
