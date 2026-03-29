@@ -1,7 +1,8 @@
 rumps
 sounddevice
-scipy
+soundfile
 numpy
 groq
-pyperclip
+httpx[http2]
 python-dotenv
+pyobjc-framework-AVFoundation
