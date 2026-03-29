@@ -1,4 +1,4 @@
-"""GroqTalkApp -- the rumps.App class with all menu setup, hotkey handlers, STT/TTS pipelines."""
+"""GroqTalkApp -- native PyObjC NSStatusBar app (no rumps dependency)."""
 from __future__ import annotations
 
 import io
@@ -9,12 +9,11 @@ import threading
 import time
 
 import numpy as np
-import rumps
 import sounddevice as sd
 import soundfile as sf
 from AVFoundation import AVAudioPlayer
-from Foundation import NSData
-from PyObjCTools import AppHelper
+from Foundation import NSData, NSObject, NSUserNotification, NSUserNotificationCenter
+from AppKit import NSApplication, NSStatusBar, NSMenu, NSMenuItem, NSVariableStatusItemLength
 
 from .config import (
     log, groq_client,
@@ -33,23 +32,62 @@ from .history import (
 )
 
 
-def _on_main(func: callable) -> None:
-    """Dispatch a function to run on the main thread (required for all UI updates)."""
-    AppHelper.callAfter(func)
-
-
 def _notify(title: str, subtitle: str, message: str) -> None:
-    """Thread-safe notification."""
-    _on_main(lambda: rumps.notification(title, subtitle, message))
+    """Post a macOS notification via NSUserNotificationCenter."""
+    def _do():
+        n = NSUserNotification.alloc().init()
+        n.setTitle_(title)
+        n.setSubtitle_(subtitle)
+        n.setInformativeText_(message)
+        NSUserNotificationCenter.defaultUserNotificationCenter().deliverNotification_(n)
+    _on_main(_do)
 
 
-class GroqTalkApp(rumps.App):
-    """Menubar app for voice-to-text and text-to-speech."""
+class _UIProxy(NSObject):
+    """Tiny NSObject subclass whose selectors run on the main thread."""
 
-    LIVE_INTERVAL: float = 5.0  # seconds between live Whisper calls
+    _instance = None
+    _pending_calls: list = []
+    _pending_lock = threading.Lock()
+
+    @classmethod
+    def shared(cls):
+        if cls._instance is None:
+            cls._instance = cls.alloc().init()
+        return cls._instance
+
+    def runPending_(self, _sender):
+        """Selector called on main thread -- drains pending closures."""
+        with type(self)._pending_lock:
+            calls = list(type(self)._pending_calls)
+            type(self)._pending_calls.clear()
+        for fn in calls:
+            try:
+                fn()
+            except Exception:
+                log.exception("[UIProxy] error in main-thread closure")
+
+
+def _on_main(fn):
+    """Dispatch fn to the main thread via performSelectorOnMainThread."""
+    proxy = _UIProxy.shared()
+    with type(proxy)._pending_lock:
+        type(proxy)._pending_calls.append(fn)
+    proxy.performSelectorOnMainThread_withObject_waitUntilDone_(
+        "runPending:", None, False,
+    )
+
+
+class GroqTalkApp:
+    """Menubar app for voice-to-text and text-to-speech using native PyObjC."""
+
+    LIVE_INTERVAL: float = 5.0
 
     def __init__(self) -> None:
-        super().__init__("GroqTalk", title=ICON_IDLE)
+        self._app = NSApplication.sharedApplication()
+        # LSUIElement — no dock icon
+        self._app.setActivationPolicy_(2)  # NSApplicationActivationPolicyProhibited
+
         self.recording: bool = False
         self._audio_frames: list[np.ndarray] = []
         self._tts_generation: int = 0
@@ -61,72 +99,223 @@ class GroqTalkApp(rumps.App):
         self._current_voice: str = TTS_VOICE
         self._playback_rate: float = 1.0
         self._live_transcript: str = ""
-
-        self._build_menu()
-        self._refresh_cost(None)
-        self._setup_hotkeys()
         self._stream = None
+        self._title = ICON_IDLE
+
+        self._build_status_item()
+        self._refresh_cost()
+        self._setup_hotkeys()
         threading.Thread(target=self._keep_alive, daemon=False).start()
         threading.Thread(target=self._warm_connection, daemon=True).start()
         log.info("GroqTalk started -- look for %s in menu bar", ICON_IDLE)
         log.info("Hotkeys: Cmd+Shift+A (Record/STT) | Cmd+Shift+D (Speak) | Cmd+Shift+R (Replay) | Cmd+Shift+S (Stop)")
 
-    # --- Menu construction --------------------------------------------------
+    # ------------------------------------------------------------------
+    # Status bar + menu
+    # ------------------------------------------------------------------
 
-    def _build_menu(self) -> None:
-        """Build the full menubar menu."""
-        self._enhance_item = rumps.MenuItem(
-            "Enhance Text (LLM)", callback=self._toggle_enhance,
+    def _build_status_item(self) -> None:
+        """Create the NSStatusItem and its menu."""
+        self._status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength,
         )
-        self._enhance_item.state = 1
-        self._voice_menu = self._build_voice_menu()
-        self._speed_menu = self._build_speed_menu()
-        self._cost_item = rumps.MenuItem("Usage: $0.00 (3 days)")
-        self._cost_item.set_callback(self._refresh_cost)
-        self._audios_menu = rumps.MenuItem("Recent Audios")
-        self._texts_menu = rumps.MenuItem("Recent Texts")
-        self._build_history_items(self._audios_menu, self._texts_menu)
-        self._stop_item = rumps.MenuItem("Stop  (Cmd+Shift+S)", callback=self._stop_all)
-        self._ui_set_stop(False)
-        self.menu = [
-            rumps.MenuItem("Speech -> Text  (Cmd+Shift+A)"),
-            rumps.MenuItem("Speak Selection  (Cmd+Shift+D)"),
-            rumps.MenuItem("Replay Latest   (Cmd+Shift+R)"),
-            self._stop_item,
-            None,
-            self._audios_menu,
-            self._texts_menu,
-            None,
-            self._enhance_item,
-            self._voice_menu,
-            self._speed_menu,
-            self._cost_item,
-        ]
+        self._status_item.setTitle_(ICON_IDLE)
+        self._status_item.setHighlightMode_(True)
 
-    def _build_voice_menu(self) -> rumps.MenuItem:
-        """Build voice selection submenu."""
-        menu = rumps.MenuItem("Voice")
+        menu = NSMenu.alloc().init()
+
+        # Record
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Speech -> Text  (Cmd+Shift+A)", "menuRecord:", "",
+        )
+        item.setTarget_(self._delegate)
+        menu.addItem_(item)
+
+        # Speak
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Speak Selection  (Cmd+Shift+D)", "menuSpeak:", "",
+        )
+        item.setTarget_(self._delegate)
+        menu.addItem_(item)
+
+        # Replay
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Replay Latest   (Cmd+Shift+R)", "menuReplay:", "",
+        )
+        item.setTarget_(self._delegate)
+        menu.addItem_(item)
+
+        # Stop
+        self._stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Stop  (Cmd+Shift+S)", "menuStop:", "",
+        )
+        self._stop_item.setTarget_(self._delegate)
+        self._stop_item.setHidden_(True)
+        menu.addItem_(self._stop_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Recent Audios submenu
+        self._audios_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recent Audios", None, "",
+        )
+        self._audios_submenu = NSMenu.alloc().init()
+        self._audios_item.setSubmenu_(self._audios_submenu)
+        menu.addItem_(self._audios_item)
+
+        # Recent Texts submenu
+        self._texts_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recent Texts", None, "",
+        )
+        self._texts_submenu = NSMenu.alloc().init()
+        self._texts_item.setSubmenu_(self._texts_submenu)
+        menu.addItem_(self._texts_item)
+
+        self._build_history_items()
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Enhance toggle
+        self._enhance_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Enhance Text (LLM)", "menuToggleEnhance:", "",
+        )
+        self._enhance_item.setTarget_(self._delegate)
+        self._enhance_item.setState_(1)
+        menu.addItem_(self._enhance_item)
+
+        # Voice submenu
+        voice_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Voice", None, "",
+        )
+        self._voice_submenu = NSMenu.alloc().init()
         for voice in TTS_VOICES:
             icon = "\U0001f469" if voice in ("hannah", "diana", "autumn") else "\U0001f468"
             label = f"{icon} {voice}"
-            item = rumps.MenuItem(label, callback=self._set_voice)
-            item.representedObject = voice
+            vi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, "menuSetVoice:", "",
+            )
+            vi.setTarget_(self._delegate)
+            vi.setRepresentedObject_(voice)
             if voice == TTS_VOICE:
-                item.state = 1
-            menu.add(item)
-        return menu
+                vi.setState_(1)
+            self._voice_submenu.addItem_(vi)
+        voice_item.setSubmenu_(self._voice_submenu)
+        menu.addItem_(voice_item)
 
-    def _build_speed_menu(self) -> rumps.MenuItem:
-        """Build playback speed submenu."""
-        menu = rumps.MenuItem("Playback Speed")
+        # Speed submenu
+        speed_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Playback Speed", None, "",
+        )
+        self._speed_submenu = NSMenu.alloc().init()
         for rate in ["0.75x", "1.0x", "1.25x", "1.5x", "1.75x", "2.0x"]:
-            item = rumps.MenuItem(rate, callback=self._set_speed)
+            si = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                rate, "menuSetSpeed:", "",
+            )
+            si.setTarget_(self._delegate)
             if rate == "1.0x":
-                item.state = 1
-            menu.add(item)
-        return menu
+                si.setState_(1)
+            self._speed_submenu.addItem_(si)
+        speed_item.setSubmenu_(self._speed_submenu)
+        menu.addItem_(speed_item)
 
-    # --- Audio stream (on-demand) -------------------------------------------
+        # Cost
+        self._cost_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Usage: $0.00 (3 days)", "menuRefreshCost:", "",
+        )
+        self._cost_item.setTarget_(self._delegate)
+        menu.addItem_(self._cost_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Quit
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit", "menuQuit:", "",
+        )
+        quit_item.setTarget_(self._delegate)
+        menu.addItem_(quit_item)
+
+        self._status_item.setMenu_(menu)
+
+    @property
+    def _delegate(self):
+        """Lazily create the _Delegate singleton that routes menu actions back to self."""
+        if not hasattr(self, "__delegate"):
+            self.__delegate = _Delegate.alloc().init()
+            self.__delegate._app_ref = self
+        return self.__delegate
+
+    @property
+    def title(self) -> str:
+        return self._title
+
+    @title.setter
+    def title(self, value: str) -> None:
+        self._title = value
+        self._status_item.setTitle_(value)
+
+    # ------------------------------------------------------------------
+    # History submenus
+    # ------------------------------------------------------------------
+
+    def _build_history_items(self) -> None:
+        """Populate Recent Audios / Recent Texts submenus."""
+        self._audios_submenu.removeAllItems()
+        self._texts_submenu.removeAllItems()
+
+        entries = load_history()
+        audio_count = 0
+        for e in reversed(entries):
+            if not (e.get("tts_wav") and os.path.exists(e["tts_wav"])):
+                continue
+            ago = relative_time(e.get("ts", ""))
+            preview = (e.get("cleaned") or "")[:40]
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{ago} -- {preview}", "menuReplayEntry:", "",
+            )
+            item.setTarget_(self._delegate)
+            item.setRepresentedObject_(e["tts_wav"])
+            self._audios_submenu.addItem_(item)
+            audio_count += 1
+        if audio_count == 0:
+            placeholder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "(no audios yet)", None, "",
+            )
+            self._audios_submenu.addItem_(placeholder)
+
+        text_count = 0
+        for e in reversed(entries):
+            text = e.get("cleaned") or e.get("transcript")
+            if not text or not e.get("wav"):
+                continue
+            ago = relative_time(e.get("ts", ""))
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{ago} -- {text[:40]}", "menuReuseText:", "",
+            )
+            item.setTarget_(self._delegate)
+            item.setRepresentedObject_(text)
+            self._texts_submenu.addItem_(item)
+            text_count += 1
+        if text_count == 0:
+            placeholder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "(no texts yet)", None, "",
+            )
+            self._texts_submenu.addItem_(placeholder)
+
+    def _refresh_history(self) -> None:
+        self._build_history_items()
+
+    def _refresh_cost(self) -> None:
+        cost, totals = get_cost_last_n_days(3)
+        self._cost_item.setTitle_(f"Usage: ${cost:.4f} (3 days) | {totals['calls']} calls")
+        log.debug(
+            "[COST] $%.4f -- whisper=%.0fs, llm=%d+%d tok, tts=%d chars, calls=%d",
+            cost, totals["whisper_sec"], totals["llm_in_tok"],
+            totals["llm_out_tok"], totals["tts_chars"], totals["calls"],
+        )
+
+    # ------------------------------------------------------------------
+    # Audio stream (on-demand)
+    # ------------------------------------------------------------------
 
     def _audio_callback(
         self, indata: np.ndarray, frames: int, time_info: object, status: object,
@@ -136,16 +325,16 @@ class GroqTalkApp(rumps.App):
         if self.recording:
             self._audio_frames.append(indata.copy())
 
-    # --- Lifecycle helpers --------------------------------------------------
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def _keep_alive(self) -> None:
-        """Non-daemon thread that keeps the app alive."""
         while not self._shutdown_event.is_set():
             time.sleep(1)
         log.info("[KEEPALIVE] shutdown")
 
     def _warm_connection(self) -> None:
-        """Pre-warm HTTP connection to Groq."""
         try:
             t0 = time.time()
             groq_client.models.list()
@@ -158,9 +347,15 @@ class GroqTalkApp(rumps.App):
         register_hotkey(kVK_ANSI_A, cmdKey | shiftKey, 1, self._toggle_recording)
         register_hotkey(kVK_ANSI_D, cmdKey | shiftKey, 2, self._speak_selected)
         register_hotkey(kVK_ANSI_R, cmdKey | shiftKey, 3, self._replay_recording)
-        register_hotkey(kVK_ANSI_S, cmdKey | shiftKey, 4, lambda: self._stop_all(None))
+        register_hotkey(kVK_ANSI_S, cmdKey | shiftKey, 4, lambda: self._stop_all())
 
-    # --- Speech-to-Text (live partial every 5s) ----------------------------
+    def run(self) -> None:
+        """Start the NSApplication run loop."""
+        self._app.run()
+
+    # ------------------------------------------------------------------
+    # Speech-to-Text
+    # ------------------------------------------------------------------
 
     def _toggle_recording(self) -> None:
         log.info("[REC] Cmd+Shift+A pressed -- recording=%s", self.recording)
@@ -188,7 +383,6 @@ class GroqTalkApp(rumps.App):
             self._ui_set_title(ICON_IDLE)
 
     def _live_transcribe(self) -> None:
-        """Every 5s, send only NEW audio to Whisper and append to transcript."""
         log.info("[LIVE] live transcription thread started")
         last_frame_idx = 0
         parts: list[str] = []
@@ -242,7 +436,7 @@ class GroqTalkApp(rumps.App):
             try:
                 if stream:
                     try:
-                        stream.abort()  # abort() is non-blocking unlike stop()
+                        stream.abort()
                         stream.close()
                     except Exception:
                         log.debug("[REC] stream close error (non-fatal)")
@@ -255,7 +449,6 @@ class GroqTalkApp(rumps.App):
         threading.Thread(target=_close_and_process, daemon=True).start()
 
     def _process_audio(self, frames: list[np.ndarray]) -> None:
-        """Full STT pipeline: audio -> Whisper -> optional LLM -> clipboard."""
         pipeline_start = time.time()
         log.info("[STT] final pipeline started, frames=%d", len(frames))
         try:
@@ -298,7 +491,6 @@ class GroqTalkApp(rumps.App):
             self._ui_set_title(ICON_IDLE)
 
     def _save_recording_wav(self, raw_audio: np.ndarray) -> None:
-        """Trim and save raw audio as WAV for replay + history."""
         audio = trim_silence(raw_audio)
         wav_buf = io.BytesIO()
         sf.write(wav_buf, (audio * 32767).astype(np.int16), SAMPLE_RATE, format="WAV")
@@ -308,7 +500,6 @@ class GroqTalkApp(rumps.App):
     def _transcribe_whisper(
         self, ogg_bytes: bytes, mime: str, duration: float,
     ) -> str:
-        """Send audio to Groq Whisper and return raw transcript."""
         log.info("[STT] sending to Groq Whisper (%s)...", WHISPER_MODEL)
         t0 = time.time()
         transcription = groq_client.audio.transcriptions.create(
@@ -331,7 +522,6 @@ class GroqTalkApp(rumps.App):
         return raw_text
 
     def _enhance_transcript(self, raw_text: str) -> str:
-        """Optionally clean up transcript with LLM."""
         word_count = len(raw_text.split())
         if not self._enhance_text:
             log.info("[STT] enhance OFF -- skipping LLM")
@@ -355,17 +545,17 @@ class GroqTalkApp(rumps.App):
         log.info("[STT] LLM done in %.2fs -- %d chars", elapsed, len(cleaned))
         return cleaned
 
-    # --- Replay latest recording -------------------------------------------
+    # ------------------------------------------------------------------
+    # Replay
+    # ------------------------------------------------------------------
 
     def _stop_replay(self) -> None:
-        """Stop any currently playing replay."""
         self._replay_generation += 1
         if self._replay_player and self._replay_player.isPlaying():
             self._replay_player.stop()
             log.info("[REPLAY] stopped previous playback")
 
     def _replay_recording(self) -> None:
-        """Play back the latest voice recording (Cmd+Shift+R)."""
         self._stop_replay()
         entries = load_history()
         for e in reversed(entries):
@@ -380,10 +570,8 @@ class GroqTalkApp(rumps.App):
         log.info("[REPLAY] no recording to replay")
         _notify("GroqTalk", "", "No recording to replay.")
 
-    def _replay_entry(self, sender: rumps.MenuItem) -> None:
-        """Replay a specific history entry from the menu."""
+    def _replay_entry(self, wav_path: str) -> None:
         self._stop_replay()
-        wav_path = sender.representedObject
         if wav_path and os.path.exists(wav_path):
             gen = self._replay_generation
             threading.Thread(
@@ -392,16 +580,13 @@ class GroqTalkApp(rumps.App):
         else:
             _notify("GroqTalk", "", "Recording file not found.")
 
-    def _reuse_entry_text(self, sender: rumps.MenuItem) -> None:
-        """Copy a history entry's cleaned text back to clipboard and paste."""
-        text = sender.representedObject
+    def _reuse_entry_text(self, text: str) -> None:
         if text:
             clipboard_write(text)
             simulate_paste()
             log.info("[HISTORY] reused text: %s...", text[:60])
 
     def _run_replay(self, wav_path: str, gen: int) -> None:
-        """Play a WAV file via AVAudioPlayer."""
         try:
             self._ui_set_title(ICON_SPEAKING)
             self._ui_set_stop(True)
@@ -430,10 +615,12 @@ class GroqTalkApp(rumps.App):
                 self._ui_set_title(ICON_IDLE)
                 self._ui_set_stop(False)
 
-    # --- Text-to-Speech (chunked pipeline) ---------------------------------
+    # ------------------------------------------------------------------
+    # TTS
+    # ------------------------------------------------------------------
 
     def _speak_selected(self) -> None:
-        was_speaking = self.title == ICON_SPEAKING
+        was_speaking = self._title == ICON_SPEAKING
         self._tts_generation += 1
         gen = self._tts_generation
         subprocess.run(["pkill", "-f", "afplay"], capture_output=True)
@@ -446,7 +633,6 @@ class GroqTalkApp(rumps.App):
         threading.Thread(target=self._run_tts, args=(gen,), daemon=True).start()
 
     def _run_tts(self, gen: int) -> None:
-        """Full TTS pipeline: get text -> chunk -> fetch audio -> play."""
         pipeline_start = time.time()
         try:
             text = get_selected_text()
@@ -483,7 +669,6 @@ class GroqTalkApp(rumps.App):
                 self._ui_set_stop(False)
 
     def _stream_tts_chunks(self, chunks: list[str], gen: int) -> bytes:
-        """Prefetch and play TTS chunks. Returns concatenated WAV bytes."""
         prefetch_q: queue.Queue[tuple[int, bytes]] = queue.Queue()
         all_wav_data = b""
 
@@ -527,7 +712,6 @@ class GroqTalkApp(rumps.App):
         return all_wav_data
 
     def _play_wav_bytes(self, wav_data: bytes, gen: int) -> None:
-        """Play WAV bytes via AVAudioPlayer with current speed setting."""
         ns_data = NSData.dataWithBytes_length_(wav_data, len(wav_data))
         player, err = AVAudioPlayer.alloc().initWithData_error_(ns_data, None)
         if err or not player:
@@ -543,34 +727,25 @@ class GroqTalkApp(rumps.App):
                 break
             time.sleep(0.05)
 
-    # --- UI helpers (all dispatched to main thread) -------------------------
+    # ------------------------------------------------------------------
+    # UI helpers (dispatched to main thread)
+    # ------------------------------------------------------------------
 
     def _ui_set_title(self, icon: str) -> None:
-        """Thread-safe title update."""
         _on_main(lambda: setattr(self, 'title', icon))
 
     def _ui_set_stop(self, visible: bool) -> None:
-        """Thread-safe stop button visibility."""
         def _do():
             try:
-                self._stop_item._menuitem.setHidden_(not visible)
+                self._stop_item.setHidden_(not visible)
             except Exception:
                 pass
         _on_main(_do)
 
     def _ui_refresh(self) -> None:
-        """Thread-safe history + cost refresh."""
-        _on_main(lambda: (self._refresh_history(), self._refresh_cost(None)))
+        _on_main(lambda: (self._refresh_history(), self._refresh_cost()))
 
-    def _set_stop_visible(self, visible: bool) -> None:
-        """Show/hide the Stop menu item (main thread only)."""
-        try:
-            self._stop_item._menuitem.setHidden_(not visible)
-        except Exception:
-            pass
-
-    def _stop_all(self, _sender: object) -> None:
-        """Stop all playback -- TTS, replay, everything."""
+    def _stop_all(self) -> None:
         self._tts_generation += 1
         self._stop_replay()
         subprocess.run(["pkill", "-f", "afplay"], capture_output=True)
@@ -578,74 +753,30 @@ class GroqTalkApp(rumps.App):
         self._ui_set_stop(False)
         log.info("[STOP] all playback stopped")
 
-    def _toggle_enhance(self, sender: rumps.MenuItem) -> None:
+    # ------------------------------------------------------------------
+    # Menu action handlers (called from _Delegate on main thread)
+    # ------------------------------------------------------------------
+
+    def _menu_toggle_enhance(self) -> None:
         self._enhance_text = not self._enhance_text
-        sender.state = 1 if self._enhance_text else 0
+        self._enhance_item.setState_(1 if self._enhance_text else 0)
         log.info("[UI] Enhance Text toggled: %s", "ON" if self._enhance_text else "OFF")
 
-    def _set_voice(self, sender: rumps.MenuItem) -> None:
-        self._current_voice = sender.representedObject
-        for item in self._voice_menu.values():
-            item.state = 1 if item.title == sender.title else 0
+    def _menu_set_voice(self, sender) -> None:
+        self._current_voice = sender.representedObject()
+        for i in range(self._voice_submenu.numberOfItems()):
+            item = self._voice_submenu.itemAtIndex_(i)
+            item.setState_(1 if item.title() == sender.title() else 0)
         log.info("[UI] Voice set to %s", self._current_voice)
 
-    def _set_speed(self, sender: rumps.MenuItem) -> None:
-        self._playback_rate = float(sender.title.replace("x", ""))
-        for item in self._speed_menu.values():
-            item.state = 1 if item.title == sender.title else 0
+    def _menu_set_speed(self, sender) -> None:
+        self._playback_rate = float(sender.title().replace("x", ""))
+        for i in range(self._speed_submenu.numberOfItems()):
+            item = self._speed_submenu.itemAtIndex_(i)
+            item.setState_(1 if item.title() == sender.title() else 0)
         log.info("[UI] Playback speed set to %sx", self._playback_rate)
 
-    def _build_history_items(
-        self, audios_menu: rumps.MenuItem, texts_menu: rumps.MenuItem,
-    ) -> None:
-        """Populate submenus from history."""
-        entries = load_history()
-        audio_count = 0
-        for e in reversed(entries):
-            if not (e.get("tts_wav") and os.path.exists(e["tts_wav"])):
-                continue
-            ago = relative_time(e.get("ts", ""))
-            preview = (e.get("cleaned") or "")[:40]
-            item = rumps.MenuItem(f"{ago} -- {preview}", callback=self._replay_entry)
-            item.representedObject = e["tts_wav"]
-            audios_menu.add(item)
-            audio_count += 1
-        if audio_count == 0:
-            audios_menu.add(rumps.MenuItem("(no audios yet)"))
-
-        text_count = 0
-        for e in reversed(entries):
-            text = e.get("cleaned") or e.get("transcript")
-            if not text or not e.get("wav"):
-                continue
-            ago = relative_time(e.get("ts", ""))
-            item = rumps.MenuItem(f"{ago} -- {text[:40]}", callback=self._reuse_entry_text)
-            item.representedObject = text
-            texts_menu.add(item)
-            text_count += 1
-        if text_count == 0:
-            texts_menu.add(rumps.MenuItem("(no texts yet)"))
-
-    def _refresh_history(self) -> None:
-        """Rebuild Recent Audios and Recent Texts submenus."""
-        try:
-            self._audios_menu.clear()
-            self._texts_menu.clear()
-        except AttributeError:
-            return
-        self._build_history_items(self._audios_menu, self._texts_menu)
-
-    def _refresh_cost(self, _sender: object) -> None:
-        """Update cost display in menu."""
-        cost, totals = get_cost_last_n_days(3)
-        self._cost_item.title = f"Usage: ${cost:.4f} (3 days) | {totals['calls']} calls"
-        log.debug(
-            "[COST] $%.4f -- whisper=%.0fs, llm=%d+%d tok, tts=%d chars, calls=%d",
-            cost, totals["whisper_sec"], totals["llm_in_tok"],
-            totals["llm_out_tok"], totals["tts_chars"], totals["calls"],
-        )
-
-    def _quit(self, _sender: object) -> None:
+    def _quit(self) -> None:
         self._shutdown_event.set()
         if self._stream:
             try:
@@ -654,4 +785,45 @@ class GroqTalkApp(rumps.App):
             except Exception:
                 pass
         unregister_all_hotkeys()
-        rumps.quit_app()
+        self._app.terminate_(None)
+
+
+class _Delegate(NSObject):
+    """Routes NSMenuItem actions back to the GroqTalkApp instance."""
+
+    _app_ref: GroqTalkApp | None = None
+
+    def menuRecord_(self, sender):
+        self._app_ref._toggle_recording()
+
+    def menuSpeak_(self, sender):
+        self._app_ref._speak_selected()
+
+    def menuReplay_(self, sender):
+        self._app_ref._replay_recording()
+
+    def menuStop_(self, sender):
+        self._app_ref._stop_all()
+
+    def menuToggleEnhance_(self, sender):
+        self._app_ref._menu_toggle_enhance()
+
+    def menuSetVoice_(self, sender):
+        self._app_ref._menu_set_voice(sender)
+
+    def menuSetSpeed_(self, sender):
+        self._app_ref._menu_set_speed(sender)
+
+    def menuRefreshCost_(self, sender):
+        self._app_ref._refresh_cost()
+
+    def menuReplayEntry_(self, sender):
+        wav_path = sender.representedObject()
+        self._app_ref._replay_entry(wav_path)
+
+    def menuReuseText_(self, sender):
+        text = sender.representedObject()
+        self._app_ref._reuse_entry_text(text)
+
+    def menuQuit_(self, sender):
+        self._app_ref._quit()

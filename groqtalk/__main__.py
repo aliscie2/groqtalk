@@ -17,7 +17,8 @@ def main() -> None:
 
     log.info("[MAIN] starting GroqTalkApp.run()")
     try:
-        GroqTalkApp().run()
+        app = GroqTalkApp()
+        app.run()
     except Exception:
         log.exception("[MAIN] app crashed")
     finally:

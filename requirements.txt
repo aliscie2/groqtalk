@@ -1,4 +1,4 @@
-rumps
+pyobjc-framework-Cocoa
 sounddevice
 soundfile
 numpy
