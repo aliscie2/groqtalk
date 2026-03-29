@@ -14,6 +14,7 @@ import sounddevice as sd
 import soundfile as sf
 from AVFoundation import AVAudioPlayer
 from Foundation import NSData
+from PyObjCTools import AppHelper
 
 from .config import (
     log, groq_client,
@@ -30,6 +31,16 @@ from .history import (
     log_usage, get_cost_last_n_days,
     load_history, add_history_entry, save_tts_to_history, find_cached_tts, relative_time,
 )
+
+
+def _on_main(func: callable) -> None:
+    """Dispatch a function to run on the main thread (required for all UI updates)."""
+    AppHelper.callAfter(func)
+
+
+def _notify(title: str, subtitle: str, message: str) -> None:
+    """Thread-safe notification."""
+    _on_main(lambda: rumps.notification(title, subtitle, message))
 
 
 class GroqTalkApp(rumps.App):
@@ -54,7 +65,7 @@ class GroqTalkApp(rumps.App):
         self._build_menu()
         self._refresh_cost(None)
         self._setup_hotkeys()
-        self._start_persistent_stream()
+        self._stream = None
         threading.Thread(target=self._keep_alive, daemon=False).start()
         threading.Thread(target=self._warm_connection, daemon=True).start()
         log.info("GroqTalk started -- look for %s in menu bar", ICON_IDLE)
@@ -76,7 +87,7 @@ class GroqTalkApp(rumps.App):
         self._texts_menu = rumps.MenuItem("Recent Texts")
         self._build_history_items(self._audios_menu, self._texts_menu)
         self._stop_item = rumps.MenuItem("Stop  (Cmd+Shift+S)", callback=self._stop_all)
-        self._set_stop_visible(False)
+        self._ui_set_stop(False)
         self.menu = [
             rumps.MenuItem("Speech -> Text  (Cmd+Shift+A)"),
             rumps.MenuItem("Speak Selection  (Cmd+Shift+D)"),
@@ -115,26 +126,15 @@ class GroqTalkApp(rumps.App):
             menu.add(item)
         return menu
 
-    # --- Persistent audio stream -------------------------------------------
-
-    def _start_persistent_stream(self) -> None:
-        """Start persistent audio input stream (never stopped)."""
-        self._persistent_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS,
-            dtype="float32", callback=self._audio_callback,
-        )
-        self._persistent_stream.start()
-        log.info(
-            "[AUDIO] persistent stream started -- device=%s",
-            sd.query_devices(sd.default.device[0])["name"],
-        )
+    # --- Audio stream (on-demand) -------------------------------------------
 
     def _audio_callback(
         self, indata: np.ndarray, frames: int, time_info: object, status: object,
     ) -> None:
         if status:
             log.warning("[REC] audio callback status: %s", status)
-        self._audio_frames.append(indata.copy())
+        if self.recording:
+            self._audio_frames.append(indata.copy())
 
     # --- Lifecycle helpers --------------------------------------------------
 
@@ -171,11 +171,21 @@ class GroqTalkApp(rumps.App):
 
     def _start_recording(self) -> None:
         log.info("[REC] starting recording...")
-        self.recording = True
-        self.title = ICON_RECORDING
         self._audio_frames = []
         self._live_transcript = ""
-        threading.Thread(target=self._live_transcribe, daemon=True).start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS,
+                dtype="float32", callback=self._audio_callback,
+            )
+            self._stream.start()
+            self.recording = True
+            self._ui_set_title(ICON_RECORDING)
+            log.info("[REC] stream opened -- device=%s", sd.query_devices(sd.default.device[0])["name"])
+            threading.Thread(target=self._live_transcribe, daemon=True).start()
+        except Exception:
+            log.exception("[REC] failed to open mic -- check permission")
+            self._ui_set_title(ICON_IDLE)
 
     def _live_transcribe(self) -> None:
         """Every 5s, send only NEW audio to Whisper and append to transcript."""
@@ -223,17 +233,26 @@ class GroqTalkApp(rumps.App):
     def _stop_recording(self) -> None:
         log.info("[REC] stopping -- %d frames captured", len(self._audio_frames))
         self.recording = False
-        self.title = ICON_PROCESSING
+        self._ui_set_title(ICON_PROCESSING)
         frames = list(self._audio_frames)
+        stream = self._stream
+        self._stream = None
 
-        def _safe_process() -> None:
+        def _close_and_process() -> None:
             try:
+                if stream:
+                    try:
+                        stream.abort()  # abort() is non-blocking unlike stop()
+                        stream.close()
+                    except Exception:
+                        log.debug("[REC] stream close error (non-fatal)")
+                log.info("[REC] stream closed, processing %d frames", len(frames))
                 self._process_audio(frames)
             except Exception:
                 log.exception("[STT] thread crashed")
-                self.title = ICON_IDLE
+                self._ui_set_title(ICON_IDLE)
 
-        threading.Thread(target=_safe_process, daemon=True).start()
+        threading.Thread(target=_close_and_process, daemon=True).start()
 
     def _process_audio(self, frames: list[np.ndarray]) -> None:
         """Full STT pipeline: audio -> Whisper -> optional LLM -> clipboard."""
@@ -242,19 +261,19 @@ class GroqTalkApp(rumps.App):
         try:
             if not frames:
                 log.warning("[STT] no audio frames captured")
-                rumps.notification("GroqTalk", "", "No audio captured.")
+                _notify("GroqTalk", "", "No audio captured.")
                 return
 
             ogg_bytes, mime, duration = prepare_audio_for_whisper(frames)
             if duration < 0.5:
                 log.warning("[STT] audio too short (%.2fs)", duration)
-                rumps.notification("GroqTalk", "", "Recording too short.")
+                _notify("GroqTalk", "", "Recording too short.")
                 return
 
             raw_audio = np.concatenate(frames, axis=0)
             if is_audio_silent(raw_audio):
                 log.warning("[STT] audio is silent -- skipping")
-                rumps.notification("GroqTalk", "", "No sound detected. Check microphone.")
+                _notify("GroqTalk", "", "No sound detected. Check microphone.")
                 return
 
             self._save_recording_wav(raw_audio)
@@ -271,13 +290,12 @@ class GroqTalkApp(rumps.App):
 
             total_time = time.time() - pipeline_start
             log.info("[STT] done in %.2fs", total_time)
-            self._refresh_history()
-            self._refresh_cost(None)
+            self._ui_refresh()
         except Exception as e:
             log.exception("[STT] pipeline error")
-            rumps.notification("GroqTalk", "Error", str(e)[:100])
+            _notify("GroqTalk", "Error", str(e)[:100])
         finally:
-            self.title = ICON_IDLE
+            self._ui_set_title(ICON_IDLE)
 
     def _save_recording_wav(self, raw_audio: np.ndarray) -> None:
         """Trim and save raw audio as WAV for replay + history."""
@@ -308,7 +326,7 @@ class GroqTalkApp(rumps.App):
         log_usage("whisper", audio_sec=duration)
         if not raw_text.strip():
             log.warning("[STT] empty transcript")
-            rumps.notification("GroqTalk", "", "No speech detected.")
+            _notify("GroqTalk", "", "No speech detected.")
             return ""
         return raw_text
 
@@ -360,7 +378,7 @@ class GroqTalkApp(rumps.App):
                 ).start()
                 return
         log.info("[REPLAY] no recording to replay")
-        rumps.notification("GroqTalk", "", "No recording to replay.")
+        _notify("GroqTalk", "", "No recording to replay.")
 
     def _replay_entry(self, sender: rumps.MenuItem) -> None:
         """Replay a specific history entry from the menu."""
@@ -372,7 +390,7 @@ class GroqTalkApp(rumps.App):
                 target=self._run_replay, args=(wav_path, gen), daemon=True,
             ).start()
         else:
-            rumps.notification("GroqTalk", "", "Recording file not found.")
+            _notify("GroqTalk", "", "Recording file not found.")
 
     def _reuse_entry_text(self, sender: rumps.MenuItem) -> None:
         """Copy a history entry's cleaned text back to clipboard and paste."""
@@ -385,15 +403,15 @@ class GroqTalkApp(rumps.App):
     def _run_replay(self, wav_path: str, gen: int) -> None:
         """Play a WAV file via AVAudioPlayer."""
         try:
-            self.title = ICON_SPEAKING
-            self._set_stop_visible(True)
+            self._ui_set_title(ICON_SPEAKING)
+            self._ui_set_stop(True)
             with open(wav_path, "rb") as f:
                 wav_data = f.read()
             ns_data = NSData.dataWithBytes_length_(wav_data, len(wav_data))
             player, err = AVAudioPlayer.alloc().initWithData_error_(ns_data, None)
             if err or not player:
                 log.error("[REPLAY] AVAudioPlayer init failed: %s", err)
-                rumps.notification("GroqTalk", "", "Replay failed.")
+                _notify("GroqTalk", "", "Replay failed.")
                 return
             self._replay_player = player
             player.prepareToPlay()
@@ -409,8 +427,8 @@ class GroqTalkApp(rumps.App):
             log.exception("[REPLAY] error")
         finally:
             if self._replay_generation == gen:
-                self.title = ICON_IDLE
-                self._set_stop_visible(False)
+                self._ui_set_title(ICON_IDLE)
+                self._ui_set_stop(False)
 
     # --- Text-to-Speech (chunked pipeline) ---------------------------------
 
@@ -421,8 +439,8 @@ class GroqTalkApp(rumps.App):
         subprocess.run(["pkill", "-f", "afplay"], capture_output=True)
         if was_speaking:
             log.info("[TTS] Cmd+Shift+D pressed while speaking -- stopped (gen=%d)", gen)
-            self.title = ICON_IDLE
-            self._set_stop_visible(False)
+            self._ui_set_title(ICON_IDLE)
+            self._ui_set_stop(False)
             return
         log.info("[TTS] Cmd+Shift+D pressed -- gen=%d, starting TTS", gen)
         threading.Thread(target=self._run_tts, args=(gen,), daemon=True).start()
@@ -436,10 +454,10 @@ class GroqTalkApp(rumps.App):
                 return
             if not text.strip():
                 log.warning("[TTS] gen=%d no text selected", gen)
-                rumps.notification("GroqTalk", "", "No text selected.")
+                _notify("GroqTalk", "", "No text selected.")
                 return
-            self.title = ICON_SPEAKING
-            self._set_stop_visible(True)
+            self._ui_set_title(ICON_SPEAKING)
+            self._ui_set_stop(True)
 
             cached = find_cached_tts(text)
             if cached:
@@ -455,15 +473,14 @@ class GroqTalkApp(rumps.App):
             if all_wav_data and self._tts_generation == gen:
                 save_tts_to_history(text, all_wav_data)
             log.info("[TTS] gen=%d done in %.2fs", gen, time.time() - pipeline_start)
-            self._refresh_history()
-            self._refresh_cost(None)
+            self._ui_refresh()
         except Exception as e:
             log.exception("[TTS] gen=%d pipeline error", gen)
-            rumps.notification("GroqTalk", "TTS Error", str(e)[:100])
+            _notify("GroqTalk", "TTS Error", str(e)[:100])
         finally:
             if self._tts_generation == gen:
-                self.title = ICON_IDLE
-                self._set_stop_visible(False)
+                self._ui_set_title(ICON_IDLE)
+                self._ui_set_stop(False)
 
     def _stream_tts_chunks(self, chunks: list[str], gen: int) -> bytes:
         """Prefetch and play TTS chunks. Returns concatenated WAV bytes."""
@@ -526,10 +543,27 @@ class GroqTalkApp(rumps.App):
                 break
             time.sleep(0.05)
 
-    # --- UI helpers ---------------------------------------------------------
+    # --- UI helpers (all dispatched to main thread) -------------------------
+
+    def _ui_set_title(self, icon: str) -> None:
+        """Thread-safe title update."""
+        _on_main(lambda: setattr(self, 'title', icon))
+
+    def _ui_set_stop(self, visible: bool) -> None:
+        """Thread-safe stop button visibility."""
+        def _do():
+            try:
+                self._stop_item._menuitem.setHidden_(not visible)
+            except Exception:
+                pass
+        _on_main(_do)
+
+    def _ui_refresh(self) -> None:
+        """Thread-safe history + cost refresh."""
+        _on_main(lambda: (self._refresh_history(), self._refresh_cost(None)))
 
     def _set_stop_visible(self, visible: bool) -> None:
-        """Show/hide the Stop menu item."""
+        """Show/hide the Stop menu item (main thread only)."""
         try:
             self._stop_item._menuitem.setHidden_(not visible)
         except Exception:
@@ -540,8 +574,8 @@ class GroqTalkApp(rumps.App):
         self._tts_generation += 1
         self._stop_replay()
         subprocess.run(["pkill", "-f", "afplay"], capture_output=True)
-        self.title = ICON_IDLE
-        self._set_stop_visible(False)
+        self._ui_set_title(ICON_IDLE)
+        self._ui_set_stop(False)
         log.info("[STOP] all playback stopped")
 
     def _toggle_enhance(self, sender: rumps.MenuItem) -> None:
@@ -613,10 +647,11 @@ class GroqTalkApp(rumps.App):
 
     def _quit(self, _sender: object) -> None:
         self._shutdown_event.set()
-        try:
-            self._persistent_stream.stop()
-            self._persistent_stream.close()
-        except Exception:
-            pass
+        if self._stream:
+            try:
+                self._stream.abort()
+                self._stream.close()
+            except Exception:
+                pass
         unregister_all_hotkeys()
         rumps.quit_app()
