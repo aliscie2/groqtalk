@@ -527,26 +527,19 @@ class GroqTalkApp:
         self.recording = False
         self._ui_set_title(ICON_PROCESSING)
         frames = list(self._audio_frames)
-        stream = self._stream
+        # Don't call stream.abort()/close() — causes PortAudio deadlock.
+        # Just drop the reference; GC + PortAudio handle cleanup.
         self._stream = None
+        log.info("[REC] stream released, processing %d frames", len(frames))
 
-        def _close_and_process() -> None:
+        def _process() -> None:
             try:
-                self._close_stream(stream)
                 self._process_audio(frames)
             except Exception:
                 log.exception("[STT] thread crashed")
                 self._ui_set_title(ICON_IDLE)
 
-        threading.Thread(target=_close_and_process, daemon=True).start()
-
-    def _close_stream(self, stream: object) -> None:
-        if stream:
-            try:
-                stream.abort()
-                stream.close()
-            except Exception:
-                log.debug("[REC] stream close error (non-fatal)")
+        threading.Thread(target=_process, daemon=True).start()
         log.info("[REC] stream closed")
 
     def _process_audio(self, frames: list[np.ndarray]) -> None:
@@ -860,12 +853,22 @@ class GroqTalkApp:
         _on_main(lambda: (self._refresh_history(), self._refresh_cost()))
 
     def _stop_all(self) -> None:
+        """Nuclear stop — kills recording, TTS, replay, everything."""
+        # Stop recording if active
+        if self.recording:
+            self.recording = False
+            self._stream = None
+            log.info("[STOP] recording stopped")
+        # Stop TTS
         self._tts_generation += 1
+        # Stop replay
         self._stop_replay()
+        # Kill any external audio
         subprocess.run(["pkill", "-f", "afplay"], capture_output=True)
+        # Reset UI
         self._ui_set_title(ICON_IDLE)
         self._ui_set_stop(False)
-        log.info("[STOP] all playback stopped")
+        log.info("[STOP] all stopped")
 
     # ------------------------------------------------------------------
     # Menu action handlers
