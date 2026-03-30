@@ -62,6 +62,85 @@ def prepare_audio_for_whisper(
     return ogg, "audio/ogg", trim_dur
 
 
+def clean_text_for_speech(text: str) -> str:
+    """Transform technical text into natural speech-friendly text."""
+    t = text
+
+    # URLs first (before other transforms): https://api.groq.com/... → "groq dot com"
+    t = re.sub(r"https?://(?:www\.)?([a-zA-Z0-9.-]+)\S*",
+               lambda m: _speak_domain(m.group(1)), t)
+
+    # Version patterns: HTTP/2, Python/3.12 → "H-T-T-P 2", "Python 3.12"
+    t = re.sub(r"\b(\w+)/(\d[\d.]*)\b", r"\1 \2", t)
+
+    # File paths: /path/to/file.py → "file dot py"
+    t = re.sub(r"[~/][\w./-]+/(\w[\w.-]*)", lambda m: _speak_filename(m.group(1)), t)
+
+    # Standalone filenames: server.py, http_server.py → "server dot py"
+    t = re.sub(r"\b([\w-]+)\.(py|js|ts|tsx|jsx|rs|go|sh|yaml|yml|json|toml|md|txt|css|html|sql|env)\b",
+               lambda m: f"{m.group(1).replace('_', ' ')} dot {m.group(2)}", t)
+
+    # Common abbreviations
+    _abbrevs = {
+        "HTTP": "H-T-T-P", "HTTPS": "H-T-T-P-S", "API": "A-P-I",
+        "URL": "U-R-L", "CLI": "C-L-I", "SDK": "S-D-K",
+        "JSON": "jason", "YAML": "yaml", "SQL": "sequel",
+        "HTML": "H-T-M-L", "CSS": "C-S-S", "TLS": "T-L-S",
+        "SSH": "S-S-H", "GPU": "G-P-U", "CPU": "C-P-U",
+        "RAM": "ram", "OGG": "ogg", "WAV": "wave",
+        "LLM": "L-L-M", "TTS": "T-T-S", "STT": "S-T-T",
+        "RMS": "R-M-S", "ICP": "I-C-P", "AWS": "A-W-S",
+        "GCP": "G-C-P", "NPM": "N-P-M", "PIP": "pip",
+    }
+    for abbr, spoken in _abbrevs.items():
+        t = re.sub(rf"\b{abbr}\b", spoken, t)
+
+    # snake_case and kebab-case → spaces
+    t = re.sub(r"\b(\w+)[_-](\w+)(?:[_-](\w+))?(?:[_-](\w+))?\b",
+               lambda m: " ".join(g for g in m.groups() if g), t)
+
+    # CamelCase → separate words: ThreadingHTTPServer → Threading Server
+    t = re.sub(r"([a-z])([A-Z])", r"\1 \2", t)
+    t = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", t)
+
+    # Code blocks and backticks → remove
+    t = re.sub(r"```[\s\S]*?```", " code block omitted ", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+
+    # Markdown headers
+    t = re.sub(r"^#{1,6}\s*", "", t, flags=re.MULTILINE)
+
+    # Markdown bold/italic
+    t = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", t)
+
+    # Arrows and special chars
+    t = t.replace("→", "to").replace("←", "from").replace("=>", "to")
+    t = t.replace(">=", "or higher").replace("<=", "or lower")
+    t = t.replace("!=", "not equal to").replace("==", "equals")
+    t = t.replace("&&", "and").replace("||", "or")
+
+    # Repeated whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+
+    return t
+
+
+def _speak_filename(name: str) -> str:
+    """Convert filename to speech: server.py → server dot py."""
+    parts = name.rsplit(".", 1)
+    if len(parts) == 2:
+        return f"{parts[0]} dot {parts[1]}"
+    return name
+
+
+def _speak_domain(domain: str) -> str:
+    """Convert domain to speech: api.groq.com → groq dot com."""
+    parts = domain.split(".")
+    # Remove common prefixes
+    parts = [p for p in parts if p not in ("www", "api", "docs", "console")]
+    return " dot ".join(parts) if parts else domain
+
+
 def split_text_chunks(text: str, max_chars: int = TTS_CHUNK_SIZE) -> list[str]:
     """Split text into chunks at sentence boundaries for streaming TTS."""
     if len(text) <= max_chars:

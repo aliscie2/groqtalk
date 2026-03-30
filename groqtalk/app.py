@@ -31,7 +31,8 @@ from .hotkeys import (
     install_carbon_hotkey_handler, register_hotkey, unregister_all_hotkeys,
 )
 from .audio import (
-    is_audio_silent, trim_silence, prepare_audio_for_whisper, split_text_chunks,
+    is_audio_silent, trim_silence, prepare_audio_for_whisper,
+    split_text_chunks, clean_text_for_speech,
 )
 from .clipboard import clipboard_write, simulate_paste, get_selected_text
 from .history import (
@@ -755,8 +756,10 @@ class GroqTalkApp:
                 log.info("[TTS] gen=%d cache hit (%d bytes)", gen, len(cached))
                 self._play_wav_bytes(cached, gen)
                 return
-            chunks = split_text_chunks(text)
-            log.info("[TTS] gen=%d %d chars -> %d chunks", gen, len(text), len(chunks))
+            speech_text = clean_text_for_speech(text)
+            log.debug("[TTS] cleaned for speech: %s", speech_text[:120])
+            chunks = split_text_chunks(speech_text)
+            log.info("[TTS] gen=%d %d chars -> %d chunks", gen, len(speech_text), len(chunks))
             all_wav = self._stream_tts_chunks(chunks, gen)
             if all_wav and self._tts_generation == gen:
                 save_tts_to_history(text, all_wav)
