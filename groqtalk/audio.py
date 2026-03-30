@@ -76,24 +76,23 @@ def clean_text_for_speech(text: str) -> str:
     # File paths: /path/to/file.py → "file dot py"
     t = re.sub(r"[~/][\w./-]+/(\w[\w.-]*)", lambda m: _speak_filename(m.group(1)), t)
 
-    # Standalone filenames: server.py, http_server.py → "server dot py"
-    t = re.sub(r"\b([\w-]+)\.(py|js|ts|tsx|jsx|rs|go|sh|yaml|yml|json|toml|md|txt|css|html|sql|env)\b",
+    # Standalone filenames: any word.ext where ext is 1-5 lowercase letters
+    t = re.sub(r"\b([\w-]+)\.([a-z]{1,5})\b",
                lambda m: f"{m.group(1).replace('_', ' ')} dot {m.group(2)}", t)
 
-    # Common abbreviations
-    _abbrevs = {
-        "HTTP": "H-T-T-P", "HTTPS": "H-T-T-P-S", "API": "A-P-I",
-        "URL": "U-R-L", "CLI": "C-L-I", "SDK": "S-D-K",
-        "JSON": "jason", "YAML": "yaml", "SQL": "sequel",
-        "HTML": "H-T-M-L", "CSS": "C-S-S", "TLS": "T-L-S",
-        "SSH": "S-S-H", "GPU": "G-P-U", "CPU": "C-P-U",
-        "RAM": "ram", "OGG": "ogg", "WAV": "wave",
-        "LLM": "L-L-M", "TTS": "T-T-S", "STT": "S-T-T",
-        "RMS": "R-M-S", "ICP": "I-C-P", "AWS": "A-W-S",
-        "GCP": "G-C-P", "NPM": "N-P-M", "PIP": "pip",
-    }
-    for abbr, spoken in _abbrevs.items():
-        t = re.sub(rf"\b{abbr}\b", spoken, t)
+    # Pronounceable overrides (words that happen to be all-caps but should be said as-is)
+    _say_as_word = {"JSON": "jason", "YAML": "yaml", "SQL": "sequel",
+                    "RAM": "ram", "OGG": "ogg", "WAV": "wave", "PIP": "pip",
+                    "NASA": "NASA", "FEMA": "FEMA", "NATO": "NATO", "SCSI": "scuzzy"}
+
+    def _spell_abbrev(m: re.Match) -> str:
+        word = m.group(0)
+        if word in _say_as_word:
+            return _say_as_word[word]
+        return "-".join(word)  # "HTTP" → "H-T-T-P", any length
+
+    # Any ALL-CAPS word 2-7 chars: spell it out (generic pattern, not finite list)
+    t = re.sub(r"\b[A-Z]{2,7}\b", _spell_abbrev, t)
 
     # snake_case and kebab-case → spaces
     t = re.sub(r"\b(\w+)[_-](\w+)(?:[_-](\w+))?(?:[_-](\w+))?\b",
