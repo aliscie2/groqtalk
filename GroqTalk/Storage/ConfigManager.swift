@@ -1,0 +1,152 @@
+import Foundation
+
+struct ConfigManager {
+    static var shared = ConfigManager()
+
+    var apiKey: String
+    var openAIKey: String
+
+    static let sampleRate: Int = 16_000
+    static let channels: Int = 1
+    static let whisperModel = "whisper-large-v3-turbo"
+    static let llmModel = "llama-3.3-70b-versatile"
+    static let llmSystemPrompt = """
+        Fix the grammar, punctuation, and formatting of the following transcribed speech. \
+        Keep the original meaning. Return ONLY the cleaned text, nothing else. \
+        Do not add any commentary or explanation.
+        """
+    static let llmSkipWordLimit = 4
+    static let ttsBaseURL = "http://127.0.0.1:8723"
+    static let ttsModel = "mlx-community/Kokoro-82M-bf16"
+    static let ttsVoice = "af_heart"
+    static let ttsVoices = ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"]
+
+    static let silenceThreshold: Float = 0.005
+    static let silenceAboveRatio: Float = 0.1
+
+    static let iconIdle = "\u{1F399}"
+    static let iconRecording = "\u{1F534}"
+    static let iconProcessing = "\u{23F3}"
+    static let iconSpeaking = "\u{1F50A}"
+
+    static let configDir: String = {
+        let path = NSHomeDirectory() + "/.config/groqtalk"
+        try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        let historyPath = path + "/history"
+        try? FileManager.default.createDirectory(atPath: historyPath, withIntermediateDirectories: true)
+        return path
+    }()
+
+    private init() {
+        self.apiKey = ConfigManager.loadAPIKey()
+        self.openAIKey = ConfigManager.loadOpenAIKey()
+        Log.info("GROQ_API_KEY loaded: \(apiKey.isEmpty ? "NO" : "YES")")
+        Log.info("OPENAI_API_KEY loaded: \(openAIKey.isEmpty ? "NO" : "YES")")
+    }
+
+    static func loadAPIKey() -> String {
+        let paths = [
+            configDir + "/.env",
+            NSHomeDirectory() + "/.env"
+        ]
+        for path in paths {
+            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
+                for line in contents.components(separatedBy: "\n") {
+                    if line.hasPrefix("GROQ_API_KEY=") {
+                        let key = String(line.dropFirst("GROQ_API_KEY=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !key.isEmpty { return key }
+                    }
+                }
+            }
+        }
+        return ProcessInfo.processInfo.environment["GROQ_API_KEY"] ?? ""
+    }
+
+    static func loadOpenAIKey() -> String {
+        let paths = [
+            configDir + "/.env",
+            NSHomeDirectory() + "/.env"
+        ]
+        for path in paths {
+            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
+                for line in contents.components(separatedBy: "\n") {
+                    if line.hasPrefix("OPENAI_API_KEY=") {
+                        let key = String(line.dropFirst("OPENAI_API_KEY=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !key.isEmpty { return key }
+                    }
+                }
+            }
+        }
+        return ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? ""
+    }
+}
+
+// MARK: - Logging
+
+enum Log {
+    private static let logFile: FileHandle? = {
+        let path = ConfigManager.configDir + "/groqtalk.log"
+        FileManager.default.createFile(atPath: path, contents: nil)
+        return FileHandle(forWritingAtPath: path)
+    }()
+
+    static func info(_ msg: String) { write("INFO", msg) }
+    static func error(_ msg: String) { write("ERROR", msg) }
+    static func debug(_ msg: String) { write("DEBUG", msg) }
+
+    private static func write(_ level: String, _ msg: String) {
+        let ts = DateFormatter.logFormatter.string(from: Date())
+        let line = "\(ts) [\(level)] \(msg)\n"
+        logFile?.seekToEndOfFile()
+        logFile?.write(line.data(using: .utf8) ?? Data())
+    }
+}
+
+extension DateFormatter {
+    static let logFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+}
+
+// MARK: - Notifications
+
+enum NotificationHelper {
+    static func requestPermission() {
+        Log.info("[NOTIFY] using NSUserNotificationCenter")
+    }
+
+    static func send(title: String, subtitle: String = "", message: String) {
+        DispatchQueue.main.async {
+            let n = NSUserNotification()
+            n.title = title
+            n.subtitle = subtitle
+            n.informativeText = message
+            NSUserNotificationCenter.default.deliver(n)
+        }
+    }
+
+    static func sendStatus(_ message: String, subtitle: String = "") {
+        DispatchQueue.main.async {
+            let center = NSUserNotificationCenter.default
+            for d in center.deliveredNotifications where d.title == "GroqTalk" {
+                center.removeDeliveredNotification(d)
+            }
+            let n = NSUserNotification()
+            n.title = "GroqTalk"
+            n.subtitle = subtitle
+            n.informativeText = message
+            center.deliver(n)
+        }
+    }
+
+    static func clearStatus() {
+        DispatchQueue.main.async {
+            let center = NSUserNotificationCenter.default
+            for d in center.deliveredNotifications where d.title == "GroqTalk" {
+                center.removeDeliveredNotification(d)
+            }
+        }
+    }
+}

@@ -1,0 +1,350 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10001 /* GroqTalkApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10001; };
+		A10002 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10002; };
+		A10003 /* ConfigManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10003; };
+		A10004 /* HotkeyService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10004; };
+		A10005 /* StatusBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10005; };
+		A10006 /* APIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10006; };
+		A10007 /* GroqAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10007; };
+		A10008 /* AudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10008; };
+		A10009 /* AudioProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10009; };
+		A10010 /* AudioPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10010; };
+		A10011 /* ClipboardService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10011; };
+		A10012 /* TranscriptionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10012; };
+		A10013 /* SpeechService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10013; };
+		A10014 /* HistoryManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10014; };
+		A10015 /* UsageTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10015; };
+		A10016 /* TextCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10016; };
+		A10017 /* TextChunker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10017; };
+		A10018 /* AccessibilityChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10018; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B10001 /* GroqTalkApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroqTalkApp.swift; sourceTree = "<group>"; };
+		B10002 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		B10003 /* ConfigManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigManager.swift; sourceTree = "<group>"; };
+		B10004 /* HotkeyService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyService.swift; sourceTree = "<group>"; };
+		B10005 /* StatusBarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarController.swift; sourceTree = "<group>"; };
+		B10006 /* APIModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIModels.swift; sourceTree = "<group>"; };
+		B10007 /* GroqAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroqAPIClient.swift; sourceTree = "<group>"; };
+		B10008 /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
+		B10009 /* AudioProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioProcessor.swift; sourceTree = "<group>"; };
+		B10010 /* AudioPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPlayer.swift; sourceTree = "<group>"; };
+		B10011 /* ClipboardService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardService.swift; sourceTree = "<group>"; };
+		B10012 /* TranscriptionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptionService.swift; sourceTree = "<group>"; };
+		B10013 /* SpeechService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechService.swift; sourceTree = "<group>"; };
+		B10014 /* HistoryManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryManager.swift; sourceTree = "<group>"; };
+		B10015 /* UsageTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageTracker.swift; sourceTree = "<group>"; };
+		B10016 /* TextCleaner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextCleaner.swift; sourceTree = "<group>"; };
+		B10017 /* TextChunker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextChunker.swift; sourceTree = "<group>"; };
+		B10018 /* AccessibilityChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessibilityChecker.swift; sourceTree = "<group>"; };
+		B10019 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B10020 /* GroqTalk.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = GroqTalk.entitlements; sourceTree = "<group>"; };
+		P10001 /* GroqTalk.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GroqTalk.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F10001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		G10000 = {
+			isa = PBXGroup;
+			children = (
+				G10001 /* GroqTalk */,
+				G10099 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		G10001 /* GroqTalk */ = {
+			isa = PBXGroup;
+			children = (
+				G10002 /* App */,
+				G10003 /* Menu */,
+				G10004 /* Audio */,
+				G10005 /* API */,
+				G10006 /* Services */,
+				G10007 /* Storage */,
+				G10008 /* Utilities */,
+				G10009 /* Resources */,
+			);
+			path = GroqTalk;
+			sourceTree = "<group>";
+		};
+		G10002 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				B10001 /* GroqTalkApp.swift */,
+				B10002 /* AppDelegate.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		G10003 /* Menu */ = {
+			isa = PBXGroup;
+			children = (
+				B10005 /* StatusBarController.swift */,
+			);
+			path = Menu;
+			sourceTree = "<group>";
+		};
+		G10004 /* Audio */ = {
+			isa = PBXGroup;
+			children = (
+				B10008 /* AudioRecorder.swift */,
+				B10009 /* AudioProcessor.swift */,
+				B10010 /* AudioPlayer.swift */,
+			);
+			path = Audio;
+			sourceTree = "<group>";
+		};
+		G10005 /* API */ = {
+			isa = PBXGroup;
+			children = (
+				B10006 /* APIModels.swift */,
+				B10007 /* GroqAPIClient.swift */,
+			);
+			path = API;
+			sourceTree = "<group>";
+		};
+		G10006 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				B10004 /* HotkeyService.swift */,
+				B10011 /* ClipboardService.swift */,
+				B10012 /* TranscriptionService.swift */,
+				B10013 /* SpeechService.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		G10007 /* Storage */ = {
+			isa = PBXGroup;
+			children = (
+				B10003 /* ConfigManager.swift */,
+				B10014 /* HistoryManager.swift */,
+				B10015 /* UsageTracker.swift */,
+			);
+			path = Storage;
+			sourceTree = "<group>";
+		};
+		G10008 /* Utilities */ = {
+			isa = PBXGroup;
+			children = (
+				B10016 /* TextCleaner.swift */,
+				B10017 /* TextChunker.swift */,
+				B10018 /* AccessibilityChecker.swift */,
+			);
+			path = Utilities;
+			sourceTree = "<group>";
+		};
+		G10009 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				B10019 /* Info.plist */,
+				B10020 /* GroqTalk.entitlements */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		G10099 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				P10001 /* GroqTalk.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		T10001 /* GroqTalk */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CL10002 /* Build configuration list for PBXNativeTarget "GroqTalk" */;
+			buildPhases = (
+				S10001 /* Sources */,
+				F10001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = GroqTalk;
+			productName = GroqTalk;
+			productReference = P10001 /* GroqTalk.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		PR0001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1540;
+				LastUpgradeCheck = 1540;
+			};
+			buildConfigurationList = CL10001 /* Build configuration list for PBXProject "GroqTalk" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = G10000;
+			productRefGroup = G10099 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				T10001 /* GroqTalk */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		S10001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10001 /* GroqTalkApp.swift in Sources */,
+				A10002 /* AppDelegate.swift in Sources */,
+				A10003 /* ConfigManager.swift in Sources */,
+				A10004 /* HotkeyService.swift in Sources */,
+				A10005 /* StatusBarController.swift in Sources */,
+				A10006 /* APIModels.swift in Sources */,
+				A10007 /* GroqAPIClient.swift in Sources */,
+				A10008 /* AudioRecorder.swift in Sources */,
+				A10009 /* AudioProcessor.swift in Sources */,
+				A10010 /* AudioPlayer.swift in Sources */,
+				A10011 /* ClipboardService.swift in Sources */,
+				A10012 /* TranscriptionService.swift in Sources */,
+				A10013 /* SpeechService.swift in Sources */,
+				A10014 /* HistoryManager.swift in Sources */,
+				A10015 /* UsageTracker.swift in Sources */,
+				A10016 /* TextCleaner.swift in Sources */,
+				A10017 /* TextChunker.swift in Sources */,
+				A10018 /* AccessibilityChecker.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		BC1001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		BC1002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		BC2001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = GroqTalk/Resources/GroqTalk.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = GroqTalk/Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.groqtalk.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		BC2002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = GroqTalk/Resources/GroqTalk.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = GroqTalk/Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.groqtalk.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		CL10001 /* Build configuration list for PBXProject "GroqTalk" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BC1001 /* Debug */,
+				BC1002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CL10002 /* Build configuration list for PBXNativeTarget "GroqTalk" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BC2001 /* Debug */,
+				BC2002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = PR0001 /* Project object */;
+}
