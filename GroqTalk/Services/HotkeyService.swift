@@ -88,6 +88,16 @@ final class HotkeyService {
         if let ref { hotkeyRefs.append(ref) }
     }
 
+    func disableTap() {
+        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
+        Log.debug("[HOTKEY] tap disabled for dialog")
+    }
+
+    func enableTap() {
+        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+        Log.debug("[HOTKEY] tap re-enabled")
+    }
+
     func unregisterAll() {
         retryTimer?.invalidate()
         for ref in hotkeyRefs { UnregisterEventHotKey(ref) }

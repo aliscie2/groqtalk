@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let usage = UsageTracker()
     var statusBar: StatusBarController!
     private var kokoroProcess: Process?
+    private var whisperProcess: Process?
+    private var mlxSTTProcess: Process?
 
     // MARK: - State
     enum AppState { case idle, recording, processing, speaking }
@@ -20,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     var enhanceText = false
+    var sttMode: ConfigManager.STTMode = ConfigManager.defaultSTTMode
     var currentVoice = ConfigManager.ttsVoice
     var playbackRate: Float = 1.25
 
@@ -45,7 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         startKokoroServer()
-        Log.info("GroqTalk started — Fn (Record) | Ctrl+Option (Speak)")
+        if sttMode == .localSmall { startWhisperServer() }
+        else if sttMode == .localLarge { startMLXSTTServer() }
+        Log.info("GroqTalk started — Fn (Record) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue)")
     }
 
     // MARK: - Kokoro TTS Server
@@ -70,6 +75,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             Log.error("[KOKORO] failed to start: \(error)")
         }
+    }
+
+    // MARK: - Local Whisper STT Server
+
+    func startWhisperServer() {
+        // Stop existing server first
+        if let proc = whisperProcess, proc.isRunning {
+            proc.terminate()
+            whisperProcess = nil
+        }
+
+        guard let entry = ConfigManager.sttModels.first(where: { $0.mode == sttMode }) else { return }
+        let modelPath = entry.path
+        guard FileManager.default.fileExists(atPath: modelPath) else {
+            Log.error("[WHISPER] model not found at \(modelPath)")
+            NotificationHelper.sendStatus("\u{274C} Whisper model not found")
+            return
+        }
+
+        let whisperBin = "/opt/homebrew/bin/whisper-server"
+        guard FileManager.default.fileExists(atPath: whisperBin) else {
+            Log.error("[WHISPER] whisper-server not found")
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: whisperBin)
+        proc.arguments = [
+            "--model", modelPath,
+            "--host", "127.0.0.1",
+            "--port", "8724",
+            "--language", "en",
+            "--no-timestamps",
+            "--flash-attn",
+            "-bs", "1"
+        ]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+
+        do {
+            try proc.run()
+            whisperProcess = proc
+            Log.info("[WHISPER] local STT server launched (PID \(proc.processIdentifier))")
+        } catch {
+            Log.error("[WHISPER] failed to start: \(error)")
+        }
+    }
+
+    func stopWhisperServer() {
+        whisperProcess?.terminate()
+        whisperProcess = nil
+        Log.info("[WHISPER] server stopped")
+    }
+
+    // MARK: - MLX Whisper STT Server (Large)
+
+    func startMLXSTTServer() {
+        guard mlxSTTProcess == nil || !mlxSTTProcess!.isRunning else {
+            Log.info("[MLX-STT] already running")
+            return
+        }
+
+        let script = ConfigManager.configDir + "/start_stt.sh"
+        guard FileManager.default.fileExists(atPath: script) else {
+            Log.error("[MLX-STT] start_stt.sh not found")
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+
+        do {
+            try proc.run()
+            mlxSTTProcess = proc
+            Log.info("[MLX-STT] local large STT server launched (PID \(proc.processIdentifier))")
+        } catch {
+            Log.error("[MLX-STT] failed to start: \(error)")
+        }
+    }
+
+    func stopMLXSTTServer() {
+        mlxSTTProcess?.terminate()
+        mlxSTTProcess = nil
+        Log.info("[MLX-STT] server stopped")
     }
 
     // MARK: - Hotkeys
@@ -127,7 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             await TranscriptionService.process(
                 buffers: buffers, api: api, enhance: enhanceText,
-                history: history, usage: usage
+                history: history, usage: usage, sttMode: sttMode
             )
             await MainActor.run {
                 self.appState = .idle
@@ -141,7 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startLiveTranscription() {
         liveTask = Task { [weak self] in
             guard let self else { return }
-            await TranscriptionService.liveLoop(recorder: recorder, api: api, usage: usage)
+            await TranscriptionService.liveLoop(recorder: recorder, api: api, usage: usage, sttMode: sttMode)
         }
     }
 
@@ -218,7 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             await TranscriptionService.retryPending(
                 timestamp: timestamp, api: self.api, enhance: self.enhanceText,
-                history: self.history, usage: self.usage
+                history: self.history, usage: self.usage, sttMode: self.sttMode
             )
 
             await MainActor.run {
@@ -259,6 +351,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.stop()
         player.stop()
         kokoroProcess?.terminate()
+        whisperProcess?.terminate()
+        mlxSTTProcess?.terminate()
         NSApplication.shared.terminate(nil)
     }
 }

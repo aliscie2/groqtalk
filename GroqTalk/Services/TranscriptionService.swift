@@ -5,7 +5,7 @@ enum TranscriptionService {
 
     static func process(
         buffers: [AVAudioPCMBuffer], api: GroqAPIClient, enhance: Bool,
-        history: HistoryManager, usage: UsageTracker
+        history: HistoryManager, usage: UsageTracker, sttMode: ConfigManager.STTMode = .groqCloud
     ) async {
         let start = CFAbsoluteTimeGetCurrent()
         Log.info("[STT] final pipeline started, buffers=\(buffers.count)")
@@ -39,7 +39,15 @@ enum TranscriptionService {
             // Now try transcription
             NotificationHelper.sendStatus("\u{231B} Transcribing...")
 
-            let rawText = try await transcribeWhisper(wavData: wavData, duration: duration, api: api, usage: usage)
+            let rawText: String
+            switch sttMode {
+            case .groqCloud:
+                rawText = try await transcribeWhisper(wavData: wavData, duration: duration, api: api, usage: usage)
+            case .localSmall:
+                rawText = try await transcribeLocal(wavData: wavData, duration: duration, api: api, baseURL: ConfigManager.sttBaseURL)
+            case .localLarge:
+                rawText = try await transcribeLocal(wavData: wavData, duration: duration, api: api, baseURL: ConfigManager.sttLargeURL)
+            }
             guard !rawText.isEmpty else { return }
 
             if enhance && rawText.split(separator: " ").count >= ConfigManager.llmSkipWordLimit {
@@ -71,7 +79,7 @@ enum TranscriptionService {
     /// Retry transcription for a pending recording
     static func retryPending(
         timestamp: String, api: GroqAPIClient, enhance: Bool,
-        history: HistoryManager, usage: UsageTracker
+        history: HistoryManager, usage: UsageTracker, sttMode: ConfigManager.STTMode = .groqCloud
     ) async {
         guard let wavData = history.getPendingWav(timestamp: timestamp) else {
             NotificationHelper.sendStatus("\u{274C} Recording not found.")
@@ -83,7 +91,15 @@ enum TranscriptionService {
         do {
             NotificationHelper.sendStatus("\u{231B} Retrying transcription...")
 
-            let rawText = try await transcribeWhisper(wavData: wavData, duration: duration, api: api, usage: usage)
+            let rawText: String
+            switch sttMode {
+            case .groqCloud:
+                rawText = try await transcribeWhisper(wavData: wavData, duration: duration, api: api, usage: usage)
+            case .localSmall:
+                rawText = try await transcribeLocal(wavData: wavData, duration: duration, api: api, baseURL: ConfigManager.sttBaseURL)
+            case .localLarge:
+                rawText = try await transcribeLocal(wavData: wavData, duration: duration, api: api, baseURL: ConfigManager.sttLargeURL)
+            }
             guard !rawText.isEmpty else {
                 NotificationHelper.sendStatus("\u{274C} Empty transcription.")
                 return
@@ -113,6 +129,19 @@ enum TranscriptionService {
             Log.error("[STT] retry failed: \(error)")
             NotificationHelper.sendStatus("\u{274C} Retry failed — try again later.")
         }
+    }
+
+    // MARK: - Local Whisper
+
+    private static func transcribeLocal(
+        wavData: Data, duration: Double, api: GroqAPIClient, baseURL: String
+    ) async throws -> String {
+        let start = CFAbsoluteTimeGetCurrent()
+        Log.info("[STT] sending to local Whisper server (\(baseURL))...")
+        let text = try await api.transcribeLocal(wavData: wavData, baseURL: baseURL)
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        Log.info("[STT] Local Whisper done in \(String(format: "%.2f", elapsed))s — \(text.count) chars")
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Whisper
@@ -169,7 +198,7 @@ enum TranscriptionService {
 
     // MARK: - Live transcription
 
-    static func liveLoop(recorder: AudioRecorder, api: GroqAPIClient, usage: UsageTracker) async {
+    static func liveLoop(recorder: AudioRecorder, api: GroqAPIClient, usage: UsageTracker, sttMode: ConfigManager.STTMode = .groqCloud) async {
         Log.info("[LIVE] live transcription started")
         var partsCollected = 0
         let interval: UInt64 = 3_000_000_000
@@ -185,7 +214,15 @@ enum TranscriptionService {
             guard duration >= 1.0 else { continue }
 
             do {
-                let text = try await api.transcribe(wavData: wavData)
+                let text: String
+                switch sttMode {
+                case .groqCloud:
+                    text = try await api.transcribe(wavData: wavData)
+                case .localSmall:
+                    text = try await api.transcribeLocal(wavData: wavData, baseURL: ConfigManager.sttBaseURL)
+                case .localLarge:
+                    text = try await api.transcribeLocal(wavData: wavData, baseURL: ConfigManager.sttLargeURL)
+                }
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
                 ClipboardService.write(trimmed)

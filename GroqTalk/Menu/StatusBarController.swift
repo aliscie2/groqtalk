@@ -8,6 +8,7 @@ final class StatusBarController: NSObject {
 
     private var stopItem: NSMenuItem!
     private var enhanceItem: NSMenuItem!
+    private var sttSubmenu: NSMenu!
     private var costItem: NSMenuItem!
     private var audiosSubmenu: NSMenu!
     private var textsSubmenu: NSMenu!
@@ -64,6 +65,19 @@ final class StatusBarController: NSObject {
         enhanceItem.state = .off
         menu.addItem(enhanceItem)
 
+        let sttItem = NSMenuItem(title: "STT Engine", action: nil, keyEquivalent: "")
+        sttSubmenu = NSMenu()
+        sttSubmenu.autoenablesItems = false
+        for entry in ConfigManager.sttModels {
+            let mi = NSMenuItem(title: entry.label, action: #selector(handleSetSTTMode(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = entry.mode.rawValue
+            mi.state = entry.mode == ConfigManager.defaultSTTMode ? .on : .off
+            sttSubmenu.addItem(mi)
+        }
+        sttItem.submenu = sttSubmenu
+        menu.addItem(sttItem)
+
         let voiceItem = NSMenuItem(title: "Voice", action: nil, keyEquivalent: "")
         voiceSubmenu = NSMenu()
         voiceSubmenu.autoenablesItems = false
@@ -94,6 +108,10 @@ final class StatusBarController: NSObject {
         menu.addItem(costItem)
 
         menu.addItem(.separator())
+
+        let dictItem = NSMenuItem(title: "Edit Dictionary...", action: #selector(handleEditDictionary), keyEquivalent: "")
+        dictItem.target = self
+        menu.addItem(dictItem)
 
         let apiKeyItem = NSMenuItem(title: "Set API Keys...", action: #selector(handleSetAPIKey), keyEquivalent: "")
         apiKeyItem.target = self
@@ -186,6 +204,40 @@ final class StatusBarController: NSObject {
 
     // MARK: - API Key Dialog
 
+    @objc private func handleEditDictionary(_ sender: NSMenuItem) {
+        // Disable event tap so keyboard works in the dialog
+        appDelegate?.hotkeys.disableTap()
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Custom Dictionary"
+        alert.informativeText = "Add words the STT should recognize (comma-separated).\nExample: Qwen, Groq, Svelte, Tauri"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.font = NSFont.systemFont(ofSize: 13)
+        textField.stringValue = ConfigManager.loadDictionary()
+        textField.placeholderString = "Qwen, Groq, Svelte, Tauri"
+        alert.accessoryView = textField
+        alert.window.initialFirstResponder = textField
+
+        let response = alert.runModal()
+
+        // Re-enable event tap
+        appDelegate?.hotkeys.enableTap()
+
+        guard response == .alertFirstButtonReturn else { return }
+
+        let words = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        try? words.write(toFile: ConfigManager.dictionaryPath, atomically: true, encoding: .utf8)
+        NotificationHelper.send(title: "GroqTalk", message: "Dictionary saved (\(words.components(separatedBy: ",").count) words)")
+    }
+
     @objc private func handleSetAPIKey(_ sender: NSMenuItem) { promptAPIKey() }
 
     func promptAPIKey() {
@@ -259,6 +311,24 @@ final class StatusBarController: NSObject {
         guard let d = appDelegate else { return }
         d.enhanceText.toggle()
         enhanceItem.state = d.enhanceText ? .on : .off
+    }
+
+    @objc private func handleSetSTTMode(_ sender: NSMenuItem) {
+        guard let d = appDelegate, let raw = sender.representedObject as? String,
+              let mode = ConfigManager.STTMode(rawValue: raw) else { return }
+        d.sttMode = mode
+        for i in 0..<sttSubmenu.numberOfItems {
+            sttSubmenu.item(at: i)?.state = sttSubmenu.item(at: i)?.representedObject as? String == raw ? .on : .off
+        }
+        // Stop all local servers first
+        d.stopWhisperServer()
+        d.stopMLXSTTServer()
+        // Start the right one
+        switch mode {
+        case .groqCloud: break
+        case .localSmall: d.startWhisperServer()
+        case .localLarge: d.startMLXSTTServer()
+        }
     }
 
     @objc private func handleSetVoice(_ sender: NSMenuItem) {

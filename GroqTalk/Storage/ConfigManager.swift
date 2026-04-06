@@ -9,6 +9,28 @@ struct ConfigManager {
     static let sampleRate: Int = 16_000
     static let channels: Int = 1
     static let whisperModel = "whisper-large-v3-turbo"
+    static let sttBaseURL = "http://127.0.0.1:8724"       // whisper.cpp (small)
+    static let sttLargeURL = "http://127.0.0.1:8725"     // mlx-whisper (large)
+
+    enum STTMode: String { case groqCloud, localSmall, localLarge }
+    static let sttModels: [(mode: STTMode, label: String, path: String)] = [
+        (.groqCloud,  "Groq Cloud (fastest)",           ""),
+        (.localSmall, "Local Whisper Small (fast)",      configDir + "/models/ggml-small.en.bin"),
+        (.localLarge, "Local Whisper Large (accurate)",  configDir + "/models/ggml-large-v3-turbo-q5_0.bin"),
+    ]
+
+    static let systemRAM: UInt64 = ProcessInfo.processInfo.physicalMemory
+    static let systemRAMGB: Int = Int(systemRAM / (1024 * 1024 * 1024))
+
+    static var defaultSTTMode: STTMode {
+        if systemRAMGB > 16 {
+            // 24GB+ Macs: use large model by default
+            let largePath = sttModels.first(where: { $0.mode == .localLarge })?.path ?? ""
+            if FileManager.default.fileExists(atPath: largePath) { return .localLarge }
+        }
+        // 16GB or less: use small model
+        return .localSmall
+    }
     static let llmModel = "llama-3.3-70b-versatile"
     static let llmSystemPrompt = """
         Fix the grammar, punctuation, and formatting of the following transcribed speech. \
@@ -20,6 +42,13 @@ struct ConfigManager {
     static let ttsModel = "mlx-community/Kokoro-82M-bf16"
     static let ttsVoice = "af_heart"
     static let ttsVoices = ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"]
+
+    static let dictionaryPath = configDir + "/dictionary.txt"
+
+    static func loadDictionary() -> String {
+        guard let content = try? String(contentsOfFile: dictionaryPath, encoding: .utf8) else { return "" }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     static let silenceThreshold: Float = 0.005
     static let silenceAboveRatio: Float = 0.1

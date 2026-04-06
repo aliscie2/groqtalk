@@ -43,7 +43,10 @@ final class GroqAPIClient: @unchecked Sendable {
         body.append(wavData)
         append("\r\n")
 
-        for (key, value) in [("model", model), ("language", language), ("response_format", "text")] {
+        let prompt = ConfigManager.loadDictionary()
+        var fields = [("model", model), ("language", language), ("response_format", "text")]
+        if !prompt.isEmpty { fields.append(("prompt", prompt)) }
+        for (key, value) in fields {
             append("--\(boundary)\r\n")
             append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
             append("\(value)\r\n")
@@ -88,6 +91,50 @@ final class GroqAPIClient: @unchecked Sendable {
         }
 
         return try JSONDecoder().decode(ChatResponse.self, from: data)
+    }
+
+    func transcribeLocal(wavData: Data, language: String = "en", baseURL: String = ConfigManager.sttBaseURL) async throws -> String {
+        let boundary = UUID().uuidString
+        var request = URLRequest(url: URL(string: "\(baseURL)/inference")!)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 60
+
+        var body = Data()
+        func append(_ str: String) { body.append(str.data(using: .utf8)!) }
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
+        append("Content-Type: audio/wav\r\n\r\n")
+        body.append(wavData)
+        append("\r\n")
+
+        let prompt = ConfigManager.loadDictionary()
+        var fields = [("language", language), ("response_format", "text"), ("temperature", "0.0")]
+        if !prompt.isEmpty { fields.append(("prompt", prompt)) }
+        for (key, value) in fields {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
+            append("\(value)\r\n")
+        }
+        append("--\(boundary)--\r\n")
+
+        request.httpBody = body
+        let (data, response) = try await session.data(for: request)
+
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            let body = String(data: data, encoding: .utf8) ?? "unknown error"
+            Log.error("[STT LOCAL] HTTP \(http.statusCode): \(body)")
+            throw NSError(domain: "GroqTalk", code: http.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "Local Whisper error \(http.statusCode): \(body)"])
+        }
+
+        // whisper.cpp server returns JSON with "text" field
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let text = json["text"] as? String {
+            return text
+        }
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     func speechData(text: String, voice: String = ConfigManager.ttsVoice) async throws -> Data {
