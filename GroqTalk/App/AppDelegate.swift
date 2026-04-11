@@ -149,6 +149,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
 
+        proc.terminationHandler = { [weak self] process in
+            guard let self = self else { return }
+            Log.error("[MLX-STT] server exited (code \(process.terminationStatus)) — auto-restarting in 2s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                guard self.sttMode == .localLarge else { return }
+                self.mlxSTTProcess = nil
+                self.startMLXSTTServer()
+            }
+        }
+
         do {
             try proc.run()
             mlxSTTProcess = proc
@@ -159,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func stopMLXSTTServer() {
+        mlxSTTProcess?.terminationHandler = nil
         mlxSTTProcess?.terminate()
         mlxSTTProcess = nil
         Log.info("[MLX-STT] server stopped")
