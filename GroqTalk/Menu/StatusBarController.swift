@@ -8,7 +8,9 @@ final class StatusBarController: NSObject {
 
     private var stopItem: NSMenuItem!
     private var enhanceItem: NSMenuItem!
+    private var dialogItem: NSMenuItem!
     private var sttSubmenu: NSMenu!
+    private var ttsSubmenu: NSMenu!
     private var costItem: NSMenuItem!
     private var audiosSubmenu: NSMenu!
     private var textsSubmenu: NSMenu!
@@ -78,16 +80,23 @@ final class StatusBarController: NSObject {
         sttItem.submenu = sttSubmenu
         menu.addItem(sttItem)
 
+        let ttsItem = NSMenuItem(title: "TTS Engine", action: nil, keyEquivalent: "")
+        ttsSubmenu = NSMenu()
+        ttsSubmenu.autoenablesItems = false
+        for entry in ConfigManager.ttsEngines {
+            let mi = NSMenuItem(title: entry.label, action: #selector(handleSetTTSEngine(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = entry.engine.rawValue
+            mi.state = entry.engine == ConfigManager.defaultTTSEngine ? .on : .off
+            ttsSubmenu.addItem(mi)
+        }
+        ttsItem.submenu = ttsSubmenu
+        menu.addItem(ttsItem)
+
         let voiceItem = NSMenuItem(title: "Voice", action: nil, keyEquivalent: "")
         voiceSubmenu = NSMenu()
         voiceSubmenu.autoenablesItems = false
-        for voice in ConfigManager.ttsVoices {
-            let vi = NSMenuItem(title: voice, action: #selector(handleSetVoice(_:)), keyEquivalent: "")
-            vi.target = self
-            vi.representedObject = voice
-            vi.state = voice == ConfigManager.ttsVoice ? .on : .off
-            voiceSubmenu.addItem(vi)
-        }
+        rebuildVoiceSubmenu(for: ConfigManager.defaultTTSEngine)
         voiceItem.submenu = voiceSubmenu
         menu.addItem(voiceItem)
 
@@ -102,6 +111,11 @@ final class StatusBarController: NSObject {
         }
         speedItem.submenu = speedSubmenu
         menu.addItem(speedItem)
+
+        dialogItem = NSMenuItem(title: "Show TTS Dialog", action: #selector(handleToggleDialog), keyEquivalent: "")
+        dialogItem.target = self
+        dialogItem.state = ConfigManager.showTTSDialog ? .on : .off
+        menu.addItem(dialogItem)
 
         costItem = NSMenuItem(title: "Usage: $0.00 (3 days)", action: #selector(handleRefreshCost), keyEquivalent: "")
         costItem.target = self
@@ -313,6 +327,11 @@ final class StatusBarController: NSObject {
         enhanceItem.state = d.enhanceText ? .on : .off
     }
 
+    @objc private func handleToggleDialog(_ sender: NSMenuItem) {
+        ConfigManager.showTTSDialog.toggle()
+        dialogItem.state = ConfigManager.showTTSDialog ? .on : .off
+    }
+
     @objc private func handleSetSTTMode(_ sender: NSMenuItem) {
         guard let d = appDelegate, let raw = sender.representedObject as? String,
               let mode = ConfigManager.STTMode(rawValue: raw) else { return }
@@ -326,6 +345,7 @@ final class StatusBarController: NSObject {
         // Start the right one
         switch mode {
         case .groqCloud: break
+        case .parakeet: break   // uses mlx_audio.server (already running for TTS)
         case .localSmall: d.startWhisperServer()
         case .localLarge: d.startMLXSTTServer()
         }
@@ -336,6 +356,34 @@ final class StatusBarController: NSObject {
         appDelegate?.currentVoice = voice
         for i in 0..<voiceSubmenu.numberOfItems {
             voiceSubmenu.item(at: i)?.state = voiceSubmenu.item(at: i)?.representedObject as? String == voice ? .on : .off
+        }
+    }
+
+    @objc private func handleSetTTSEngine(_ sender: NSMenuItem) {
+        guard let d = appDelegate, let raw = sender.representedObject as? String,
+              let engine = ConfigManager.TTSEngine(rawValue: raw) else { return }
+        d.ttsEngine = engine
+        let entry = ConfigManager.ttsEngineEntry(engine)
+        d.currentVoice = entry.defaultVoice
+        for i in 0..<ttsSubmenu.numberOfItems {
+            ttsSubmenu.item(at: i)?.state = ttsSubmenu.item(at: i)?.representedObject as? String == raw ? .on : .off
+        }
+        rebuildVoiceSubmenu(for: engine)
+        Log.info("[TTS] engine switched to \(entry.label) — model \(entry.model)")
+        // Evict prior model from RAM (16 GB Macs OOM otherwise).
+        d.restartKokoroServer()
+    }
+
+    private func rebuildVoiceSubmenu(for engine: ConfigManager.TTSEngine) {
+        voiceSubmenu.removeAllItems()
+        let entry = ConfigManager.ttsEngineEntry(engine)
+        let currentVoice = appDelegate?.currentVoice ?? entry.defaultVoice
+        for voice in entry.voices {
+            let vi = NSMenuItem(title: voice, action: #selector(handleSetVoice(_:)), keyEquivalent: "")
+            vi.target = self
+            vi.representedObject = voice
+            vi.state = voice == currentVoice ? .on : .off
+            voiceSubmenu.addItem(vi)
         }
     }
 

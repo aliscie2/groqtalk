@@ -23,8 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     var enhanceText = false
     var sttMode: ConfigManager.STTMode = ConfigManager.defaultSTTMode
-    var currentVoice = ConfigManager.ttsVoice
+    var ttsEngine: ConfigManager.TTSEngine = ConfigManager.defaultTTSEngine
+    var currentVoice = ConfigManager.ttsEngineEntry(ConfigManager.defaultTTSEngine).defaultVoice
     var playbackRate: Float = 1.25
+
+    var currentTTSModel: String { ConfigManager.ttsEngineEntry(ttsEngine).model }
 
     private var sttTask: Task<Void, Never>?
     private var ttsTask: Task<Void, Never>?
@@ -37,6 +40,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AccessibilityChecker.checkAndPrompt()
         statusBar = StatusBarController(delegate: self)
         setupHotkeys()
+        SoundCue.prepare()
+        TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
+        TTSDialog.shared.onClose = { [weak self] in
+            self?.ttsTask?.cancel()
+            self?.player.stop()
+            self?.appState = .idle
+            self?.statusBar.setStopVisible(false)
+            TTSDialog.shared.close()
+        }
 
         if ConfigManager.shared.apiKey.isEmpty {
             Log.info("No API key — prompting user")
@@ -55,12 +67,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Kokoro TTS Server
 
-    private func startKokoroServer() {
+    /// Kill any existing mlx_audio.server (orphans from prior app runs) before spawning a fresh one.
+    private func killExistingKokoroServer() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        task.arguments = ["-f", "mlx_audio.server"]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+        task.waitUntilExit()
+        // brief delay so the port frees
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    func startKokoroServer() {
         let script = ConfigManager.configDir + "/start_tts.sh"
         guard FileManager.default.fileExists(atPath: script) else {
             Log.error("[KOKORO] start_tts.sh not found")
             return
         }
+
+        killExistingKokoroServer()
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -75,6 +102,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             Log.error("[KOKORO] failed to start: \(error)")
         }
+    }
+
+    /// Restart mlx_audio.server — evicts cached models (RAM relief on 16 GB Mac).
+    func restartKokoroServer() {
+        Log.info("[KOKORO] restarting to evict cached models")
+        kokoroProcess?.terminate()
+        kokoroProcess = nil
+        startKokoroServer()
     }
 
     // MARK: - Local Whisper STT Server
@@ -210,6 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard appState == .idle else { return }
         do {
             try recorder.start()
+            SoundCue.recordStart()
             appState = .recording
             NotificationHelper.sendStatus("\u{1F534} Recording... Press Fn to stop")
             startLiveTranscription()
@@ -222,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func stopRecording() {
         guard appState == .recording else { return }
         liveTask?.cancel()
+        SoundCue.recordStop()
         let buffers = recorder.stop()
         appState = .processing
         statusBar.setStopVisible(true)
@@ -233,8 +270,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 history: history, usage: usage, sttMode: sttMode
             )
             await MainActor.run {
-                self.appState = .idle
-                self.statusBar.setStopVisible(false)
+                if !TTSDialog.shared.isVisible {
+                    self.appState = .idle
+                    self.statusBar.setStopVisible(false)
+                }
                 self.statusBar.refreshHistory()
                 self.statusBar.refreshCost()
             }
@@ -250,6 +289,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - TTS
 
+    func jumpToChunk(_ index: Int) {
+        Log.info("[TTS] jumpToChunk \(index)")
+        ttsTask?.cancel()
+        player.stop()
+        appState = .speaking
+        statusBar.setStopVisible(true)
+        ttsTask = Task { [weak self] in
+            guard let self else { return }
+            await SpeechService.resumeFromChunk(
+                startAt: index, api: api, player: player, voice: currentVoice,
+                model: currentTTSModel, rate: playbackRate, usage: usage
+            )
+            await MainActor.run {
+                if !TTSDialog.shared.isVisible {
+                    self.appState = .idle
+                    self.statusBar.setStopVisible(false)
+                }
+            }
+        }
+    }
+
     func speakSelected() {
         // Always stop any ongoing playback first
         ttsTask?.cancel()
@@ -259,6 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appState = .idle
             statusBar.setStopVisible(false)
             NotificationHelper.clearStatus()
+            TTSDialog.shared.close()
             Log.info("[TTS] stopped by user")
             return
         }
@@ -269,12 +330,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ttsTask = Task { [weak self] in
             guard let self else { return }
             await SpeechService.speak(
-                api: api, player: player, voice: currentVoice,
+                api: api, player: player, voice: currentVoice, model: currentTTSModel,
                 rate: playbackRate, history: history, usage: usage
             )
             await MainActor.run {
-                self.appState = .idle
-                self.statusBar.setStopVisible(false)
+                if !TTSDialog.shared.isVisible {
+                    self.appState = .idle
+                    self.statusBar.setStopVisible(false)
+                }
                 self.statusBar.refreshHistory()
                 self.statusBar.refreshCost()
             }
@@ -307,8 +370,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func reuseText(_ text: String) {
-        ClipboardService.write(text)
-        NotificationHelper.send(title: "GroqTalk", message: "Copied to clipboard")
+        ttsTask?.cancel()
+        player.stop()
+        appState = .speaking
+        statusBar.setStopVisible(true)
+
+        ttsTask = Task { [weak self] in
+            guard let self else { return }
+            await SpeechService.speakDirect(
+                text: text, api: api, player: player, voice: currentVoice,
+                model: currentTTSModel, rate: playbackRate, history: history, usage: usage
+            )
+            await MainActor.run {
+                if !TTSDialog.shared.isVisible {
+                    self.appState = .idle
+                    self.statusBar.setStopVisible(false)
+                }
+                self.statusBar.refreshHistory()
+                self.statusBar.refreshCost()
+            }
+        }
     }
 
     // MARK: - Retry pending recording

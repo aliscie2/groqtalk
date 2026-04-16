@@ -11,10 +11,13 @@ struct ConfigManager {
     static let whisperModel = "whisper-large-v3-turbo"
     static let sttBaseURL = "http://127.0.0.1:8724"       // whisper.cpp (small)
     static let sttLargeURL = "http://127.0.0.1:8725"     // mlx-whisper (large)
+    static let sttMLXAudioURL = "http://127.0.0.1:8723"  // mlx_audio.server (Parakeet; shared with TTS)
+    static let parakeetModel = "mlx-community/parakeet-tdt-0.6b-v2"
 
-    enum STTMode: String { case groqCloud, localSmall, localLarge }
+    enum STTMode: String { case groqCloud, parakeet, localSmall, localLarge }
     static let sttModels: [(mode: STTMode, label: String, path: String)] = [
-        (.groqCloud,  "Groq Cloud (fastest)",           ""),
+        (.groqCloud,  "Groq Cloud (fastest)",            ""),
+        (.parakeet,   "Parakeet (local, accurate)",      ""),  // HF repo; downloaded on first use
         (.localSmall, "Local Whisper Small (fast)",      configDir + "/models/ggml-small.en.bin"),
         (.localLarge, "Local Whisper Large (accurate)",  configDir + "/models/ggml-large-v3-turbo-q5_0.bin"),
     ]
@@ -39,11 +42,31 @@ struct ConfigManager {
         """
     static let llmSkipWordLimit = 4
     static let ttsBaseURL = "http://127.0.0.1:8723"
-    static let ttsModel = "mlx-community/Kokoro-82M-bf16"
-    static let ttsVoice = "af_heart"
-    static let ttsVoices = ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"]
+
+    enum TTSEngine: String { case fast, chatterbox }
+    static let ttsEngines: [(engine: TTSEngine, label: String, model: String, voices: [String], defaultVoice: String)] = [
+        (.fast, "Fast (Kokoro)", "mlx-community/Kokoro-82M-bf16",
+         ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"],
+         "af_heart"),
+        (.chatterbox, "High Quality (Chatterbox)", "mlx-community/chatterbox-turbo-fp16",
+         ["default"], "default"),
+    ]
+    static let defaultTTSEngine: TTSEngine = .fast
+    static func ttsEngineEntry(_ engine: TTSEngine) -> (label: String, model: String, voices: [String], defaultVoice: String) {
+        let e = ttsEngines.first { $0.engine == engine } ?? ttsEngines[0]
+        return (e.label, e.model, e.voices, e.defaultVoice)
+    }
 
     static let dictionaryPath = configDir + "/dictionary.txt"
+
+    private static let showTTSDialogKey = "showTTSDialog"
+    static var showTTSDialog: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: showTTSDialogKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: showTTSDialogKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: showTTSDialogKey) }
+    }
 
     static func loadDictionary() -> String {
         guard let content = try? String(contentsOfFile: dictionaryPath, encoding: .utf8) else { return "" }
