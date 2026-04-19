@@ -5,14 +5,17 @@ enum TextCleaner {
     static func clean(_ text: String) -> String {
         var t = text
 
-        // Remove code blocks
-        t = t.replacingOccurrences(of: "```[\\s\\S]*?```", with: "", options: .regularExpression)
+        // Code blocks → spoken placeholder
+        t = t.replacingOccurrences(of: "```[\\s\\S]*?```", with: "see the code in context", options: .regularExpression)
         t = t.replacingOccurrences(of: "`([^`]+)`", with: "$1", options: .regularExpression)
 
-        // URLs → domain only
-        t = t.replacingOccurrences(of: "https?://(?:www\\.)?([^/\\s]+)[^\\s]*", with: "$1", options: .regularExpression)
+        // URLs → spoken placeholder
+        t = t.replacingOccurrences(of: "https?://[^\\s)]+", with: "see the link", options: .regularExpression)
 
-        // File paths
+        // File paths (multi-segment like /Users/foo/bar.txt)
+        t = t.replacingOccurrences(of: "(?:/[\\w.-]+){2,}", with: "see the file path", options: .regularExpression)
+
+        // Short file references
         t = t.replacingOccurrences(of: "\\b([\\w-]+)\\.([a-z]{1,4})\\b", with: "$1 dot $2", options: .regularExpression)
 
         // Markdown

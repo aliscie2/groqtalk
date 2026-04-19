@@ -42,6 +42,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupHotkeys()
         SoundCue.prepare()
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
+        TTSDialog.shared.onPauseToggle = { [weak self] in
+            guard let self else { return }
+            self.player.togglePause()
+            TTSDialog.shared.setPaused(self.player.paused)
+        }
         TTSDialog.shared.onClose = { [weak self] in
             self?.ttsTask?.cancel()
             self?.player.stop()
@@ -311,18 +316,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func speakSelected() {
-        // Always stop any ongoing playback first
-        ttsTask?.cancel()
-        player.stop()
-
-        if appState == .speaking {
-            appState = .idle
-            statusBar.setStopVisible(false)
-            NotificationHelper.clearStatus()
-            TTSDialog.shared.close()
-            Log.info("[TTS] stopped by user")
+        // If paused → resume
+        if appState == .speaking && player.paused {
+            player.togglePause()
+            TTSDialog.shared.setPaused(false)
+            statusBar.updateIcon(.speaking)
+            Log.info("[TTS] resumed")
             return
         }
+
+        // If speaking → first press pauses
+        if appState == .speaking && !player.paused {
+            player.togglePause()
+            TTSDialog.shared.setPaused(true)
+            statusBar.updateIcon(.processing)
+            Log.info("[TTS] paused")
+            return
+        }
+
+        // Not speaking → start fresh
+        ttsTask?.cancel()
+        player.stop()
         guard appState == .idle else { return }
         appState = .speaking
         statusBar.setStopVisible(true)

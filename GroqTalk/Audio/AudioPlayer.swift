@@ -6,6 +6,7 @@ final class AudioPlayer: @unchecked Sendable {
     private var audioPlayer: AVAudioPlayer?
     private let lock = NSLock()
     private(set) var cancelled = false
+    private(set) var paused = false
 
     func play(data: Data, rate: Float = 1.0) async {
         lock.lock()
@@ -28,11 +29,13 @@ final class AudioPlayer: @unchecked Sendable {
                     lock.unlock()
 
                     player.play()
-                    while player.isPlaying {
+                    while player.isPlaying || self.paused {
                         lock.lock()
                         let c = cancelled
+                        let p = paused
                         lock.unlock()
                         if c { player.stop(); break }
+                        if p && player.isPlaying { player.pause() }
                         Thread.sleep(forTimeInterval: 0.05)
                     }
                 } catch {
@@ -51,9 +54,23 @@ final class AudioPlayer: @unchecked Sendable {
         lock.unlock()
     }
 
+    func togglePause() {
+        lock.lock()
+        if paused {
+            paused = false
+            audioPlayer?.play()
+            Log.info("[PLAYER] resumed")
+        } else {
+            paused = true
+            Log.info("[PLAYER] paused")
+        }
+        lock.unlock()
+    }
+
     func reset() {
         lock.lock()
         cancelled = false
+        paused = false
         lock.unlock()
     }
 }

@@ -6,6 +6,7 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     var onChunkTap: ((Int) -> Void)?
     var onClose: (() -> Void)?
+    var onPauseToggle: (() -> Void)?
 
     private var panel: NSPanel?
     private var webView: WKWebView?
@@ -24,6 +25,12 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
     func enableChunk(_ index: Int) {
         DispatchQueue.main.async { [weak self] in
             self?.webView?.evaluateJavaScript("enableChunk(\(index))", completionHandler: nil)
+        }
+    }
+
+    func setPaused(_ paused: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.webView?.evaluateJavaScript("setPaused(\(paused))", completionHandler: nil)
         }
     }
 
@@ -168,6 +175,9 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
         case "close":
             Log.info("[DIALOG] JS close")
             onClose?()
+        case "pause":
+            Log.info("[DIALOG] JS pause toggle")
+            onPauseToggle?()
         default: break
         }
     }
@@ -197,28 +207,35 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
       }
       body::-webkit-scrollbar { width: 0; }
 
-      /* Close button */
-      .close-btn {
+      /* Top controls */
+      .top-controls {
         position: fixed;
         top: 10px;
         left: 14px;
+        display: flex;
+        gap: 6px;
+        z-index: 100;
+      }
+      .ctrl-btn {
         width: 24px;
         height: 24px;
         border-radius: 50%;
         border: none;
-        background: rgba(255,255,255, 0.10);
+        background: rgba(255,255,255, 0.08);
         color: rgba(255,255,255, 0.5);
-        font-size: 14px;
+        font-size: 11px;
         line-height: 24px;
         text-align: center;
         cursor: pointer;
-        z-index: 100;
         transition: all 0.12s;
+        padding: 0;
       }
-      .close-btn:hover {
-        background: rgba(255,90,90, 0.7);
+      .ctrl-btn:hover {
+        background: rgba(255,255,255, 0.18);
         color: #fff;
       }
+      .ctrl-btn.close:hover { background: rgba(255,90,90, 0.7); }
+      .ctrl-btn.close { font-size: 14px; }
 
       /* Chunks */
       .chunk {
@@ -301,6 +318,80 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
         border-bottom: 2px solid rgba(255,255,255,0.2);
       }
 
+      /* List item chunks */
+      .chunk.list-item {
+        padding-left: 20px;
+        position: relative;
+      }
+      .chunk.list-item::before {
+        content: '\\2022';
+        position: absolute;
+        left: 6px;
+        color: rgba(196, 181, 253, 0.6);
+      }
+
+      /* Header chunks */
+      .chunk.header-chunk {
+        font-size: 1.15em;
+        font-weight: 600;
+        color: rgba(255,255,255, 0.75);
+        padding-top: 8px;
+      }
+      .chunk.header-chunk.active {
+        color: #ffffff;
+      }
+
+      /* Code block chunks */
+      .chunk.code-chunk {
+        font-family: "SF Mono", "JetBrains Mono", monospace;
+        font-size: 0.82em;
+        background: rgba(255,255,255, 0.04);
+        border-radius: 8px;
+        padding: 10px 14px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+      }
+
+      /* Table header chunk (column names) */
+      .chunk.table-header {
+        color: rgba(196, 181, 253, 0.8);
+        font-weight: 600;
+        font-size: 0.85em;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        border-bottom: 1px solid rgba(196, 181, 253, 0.2);
+        padding-bottom: 6px;
+        margin-bottom: 2px;
+      }
+
+      /* Table-row cards */
+      .kv-row {
+        display: flex;
+        gap: 10px;
+        padding: 3px 0;
+        align-items: baseline;
+      }
+      .kv-key {
+        color: rgba(196, 181, 253, 0.85);
+        font-weight: 600;
+        font-size: 0.82em;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        min-width: 60px;
+        flex-shrink: 0;
+      }
+      .kv-val {
+        color: rgba(255,255,255, 0.88);
+      }
+      .chunk.table-row {
+        border-left: 2px solid rgba(196, 181, 253, 0.25);
+        padding-left: 14px;
+        margin-left: -4px;
+      }
+      .chunk.table-row.active {
+        border-left: 3px solid rgba(196, 181, 253, 0.7);
+      }
+
       .error {
         color: #fca5a5;
         font-weight: 500;
@@ -310,7 +401,10 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
     </style>
     </head>
     <body>
-    <button class="close-btn" onclick="doClose()" title="Close">&times;</button>
+    <div class="top-controls">
+      <button class="ctrl-btn close" onclick="doClose()" title="Close (Esc)">&times;</button>
+      <button class="ctrl-btn" id="pauseBtn" onclick="doPause()" title="Pause/Resume (Ctrl+Option)">&#9208;</button>
+    </div>
     <div id="content"></div>
     <script>
     function hasBoxChars(s) {
@@ -354,12 +448,52 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
       return html + '</table></div>';
     }
 
+    function isKVChunk(s) {
+      var lines = s.split('\\n').filter(function(l) { return l.trim(); });
+      if (lines.length < 1) return false;
+      var kvCount = lines.filter(function(l) { return /^[^:]{1,40}: .+/.test(l.trim()); }).length;
+      return kvCount === lines.length && kvCount >= 1;
+    }
+
+    function renderKV(s) {
+      var lines = s.split('\\n').filter(function(l) { return l.trim(); });
+      return lines.map(function(l) {
+        var idx = l.indexOf(': ');
+        if (idx < 0) return '<div>' + esc(l) + '</div>';
+        var key = l.substring(0, idx).trim();
+        var val = l.substring(idx + 2).trim();
+        return '<div class="kv-row"><span class="kv-key">' + esc(key) + '</span><span class="kv-val">' + inlineMd(val) + '</span></div>';
+      }).join('');
+    }
+
+    function isArrowRow(s) {
+      return s.indexOf('\\u2192') >= 0 && s.split('\\u2192').length >= 2;
+    }
+
+    function renderArrowRow(s) {
+      var parts = s.split('\\u2192').map(function(p) { return p.trim(); });
+      return '<div class="kv-row"><span class="kv-key" style="text-transform:none;font-size:1em;">' + inlineMd(parts[0]) + '</span><span class="kv-val">' + inlineMd(parts.slice(1).join(' \\u2192 ')) + '</span></div>';
+    }
+
+    function isTableHeader(s) {
+      return s.indexOf('\\u2502') >= 0 && s.split('\\u2502').length >= 2;
+    }
+
     function md(s) {
       if (hasBoxChars(s)) {
         return '<pre><code>' + s.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</code></pre>';
       }
       if (isPipeTable(s)) {
         return renderPipeTable(s);
+      }
+      if (isKVChunk(s)) {
+        return renderKV(s);
+      }
+      if (isTableHeader(s)) {
+        return esc(s).replace(/\\u2502/g, '<span style="opacity:0.3;margin:0 8px;">|</span>');
+      }
+      if (isArrowRow(s)) {
+        return renderArrowRow(s);
       }
       return s
         .replace(/&/g, '&amp;')
@@ -379,14 +513,27 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
     let activeIdx = -1;
     let enabledSet = new Set();
 
+    function chunkType(c) {
+      var t = c.trim();
+      if (isKVChunk(t)) return 'table-row';
+      if (t.indexOf('\\u2502') >= 0 && t.split('\\u2502').length >= 2) return 'table-header';
+      if (t.indexOf('\\u2192') >= 0 && t.split('\\u2192').length >= 2) return 'table-row';
+      if (/^#{1,3} /.test(t)) return 'header-chunk';
+      if (/^[-*] /.test(t) || /^\\d{1,3}[\\.\\)] /.test(t)) return 'list-item';
+      if (t.startsWith('```')) return 'code-chunk';
+      return '';
+    }
+
     function loadChunks(chunks) {
       const el = document.getElementById('content');
       el.className = '';
       enabledSet.clear();
       activeIdx = -1;
-      el.innerHTML = chunks.map((c, i) =>
-        '<div class="chunk disabled" data-i="' + i + '" onclick="tryJump(' + i + ')">' + md(c) + '</div>'
-      ).join('');
+      el.innerHTML = chunks.map((c, i) => {
+        var ct = chunkType(c);
+        var cls = 'chunk disabled' + (ct ? ' ' + ct : '');
+        return '<div class="' + cls + '" data-i="' + i + '" onclick="tryJump(' + i + ')">' + md(c) + '</div>';
+      }).join('');
     }
 
     function enableChunk(i) {
@@ -432,6 +579,15 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     function doClose() {
       window.webkit.messageHandlers.tts.postMessage({ action: 'close' });
+    }
+
+    function doPause() {
+      window.webkit.messageHandlers.tts.postMessage({ action: 'pause' });
+    }
+
+    function setPaused(paused) {
+      var btn = document.getElementById('pauseBtn');
+      if (btn) btn.innerHTML = paused ? '&#9654;' : '&#9208;';
     }
 
     // Arrow key navigation

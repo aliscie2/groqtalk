@@ -173,9 +173,9 @@ final class StatusBarController: NSObject {
             guard let ttsPath = entry.ttsWavPath, FileManager.default.fileExists(atPath: ttsPath) else { continue }
             let ago = HistoryManager.relativeTime(entry.timestamp)
             let preview = String((entry.cleaned ?? "").prefix(40))
-            let item = NSMenuItem(title: "\(ago) -- \(preview)", action: #selector(handleReplayEntry(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: "\(ago) -- \(preview)", action: #selector(handleReplaySpoken(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = ttsPath
+            item.representedObject = entry.cleaned ?? ""
             audiosSubmenu.addItem(item)
             audioCount += 1
         }
@@ -400,6 +400,11 @@ final class StatusBarController: NSObject {
     @objc private func handleReplayEntry(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
         appDelegate?.replayEntry(path: path)
+    }
+
+    @objc private func handleReplaySpoken(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String, !text.isEmpty else { return }
+        appDelegate?.reuseText(text)
     }
 
     @objc private func handleReuseText(_ sender: NSMenuItem) {
