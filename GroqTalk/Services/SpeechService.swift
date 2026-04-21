@@ -10,10 +10,11 @@ enum SpeechService {
     static var lastSession: LastSession?
     static var chunkAudio: [Int: Data] = [:]
     private static var fetchTasks: [Int: Task<Data, Error>] = [:]
-    // Word-level timings indexed by chunk; populated asynchronously by
-    // WordAligner after each chunk's WAV is fetched. Only used when the
-    // TTS dialog is visible and karaoke highlighting is active.
+    // WordAligner tasks per chunk; populated only when dialog is visible.
     private static var alignTasks: [Int: Task<Void, Never>] = [:]
+    private static let maxConcurrent = 3
+
+    // MARK: - Public entry points
 
     static func speak(
         api: GroqAPIClient, player: AudioPlayer, voice: String, model: String,
@@ -21,7 +22,6 @@ enum SpeechService {
     ) async {
         let start = CFAbsoluteTimeGetCurrent()
         player.reset()
-
         do {
             NotificationHelper.sendStatus("\u{1F50D} Getting selected text...")
             var text = ClipboardService.getSelectedText()
@@ -33,21 +33,11 @@ enum SpeechService {
 
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 NotificationHelper.sendStatus("\u{274C} No text selected or copied.")
-                try? await Task.sleep(for: .seconds(2))
-                NotificationHelper.clearStatus()
+                try? await Task.sleep(for: .seconds(2)); NotificationHelper.clearStatus()
                 return
             }
 
-            let preview = String(text.prefix(60))
-            let rawChunks = TextChunker.split(text)
-            let speechChunks = rawChunks.map { TextCleaner.clean($0) }
-            Log.info("[TTS] \(text.count) chars -> \(rawChunks.count) chunks")
-
-            let showDialog = ConfigManager.showTTSDialog
-            if showDialog {
-                TTSDialog.shared.show(text: text, chunks: rawChunks)
-            }
-            lastSession = LastSession(text: text, prettified: text, chunks: speechChunks)
+            let (preview, speechChunks, showDialog) = prepareSession(text: text)
 
             if let cached = history.findCachedTTS(text: text) {
                 Log.info("[TTS] cache hit (\(cached.count) bytes)")
@@ -60,41 +50,30 @@ enum SpeechService {
                 await player.play(data: cached, rate: rate)
                 NotificationHelper.sendStatus("\u{2705} Done", subtitle: preview)
                 if showDialog { TTSDialog.shared.finish() }
-                try? await Task.sleep(for: .seconds(2))
-                NotificationHelper.clearStatus()
+                try? await Task.sleep(for: .seconds(2)); NotificationHelper.clearStatus()
                 return
             }
 
             NotificationHelper.sendStatus("\u{231B} Loading audio...", subtitle: preview)
-
             launchParallelFetches(chunks: speechChunks, api: api, voice: voice, model: model, showDialog: showDialog)
-
             let allWav = try await playFromCache(
-                startAt: 0, player: player, rate: rate, usage: usage,
-                preview: preview, showDialog: showDialog
+                startAt: 0, player: player, rate: rate, usage: usage, preview: preview, showDialog: showDialog
             )
-
             try Task.checkCancellation()
-
             if !allWav.isEmpty { history.saveTTSToHistory(text: text, ttsWavBytes: allWav) }
 
             let elapsed = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start)
             NotificationHelper.sendStatus("\u{2705} Done in \(elapsed)s", subtitle: preview)
             Log.info("[TTS] done in \(elapsed)s")
-            if ConfigManager.showTTSDialog { TTSDialog.shared.finish() }
-            try? await Task.sleep(for: .seconds(2))
-            NotificationHelper.clearStatus()
+            if showDialog { TTSDialog.shared.finish() }
+            try? await Task.sleep(for: .seconds(2)); NotificationHelper.clearStatus()
 
         } catch is CancellationError {
             Log.info("[TTS] cancelled")
             NotificationHelper.sendStatus("\u{23F9} Stopped")
-            try? await Task.sleep(for: .seconds(1))
-            NotificationHelper.clearStatus()
+            try? await Task.sleep(for: .seconds(1)); NotificationHelper.clearStatus()
         } catch {
-            Log.error("[TTS] error: \(error)")
-            let short = humanError(error)
-            NotificationHelper.sendStatus("\u{274C} \(short)")
-            if ConfigManager.showTTSDialog { TTSDialog.shared.error(short) }
+            handleError(error, tag: "TTS", notify: true)
         }
     }
 
@@ -105,20 +84,11 @@ enum SpeechService {
     ) async {
         player.reset()
         do {
-            let rawChunks = TextChunker.split(text)
-            let speechChunks = rawChunks.map { TextCleaner.clean($0) }
-            let showDialog = ConfigManager.showTTSDialog
-            if showDialog {
-                TTSDialog.shared.show(text: text, chunks: rawChunks)
-            }
-            lastSession = LastSession(text: text, prettified: text, chunks: speechChunks)
-            Log.info("[TTS] speakDirect \(text.count) chars -> \(rawChunks.count) chunks")
-
+            let (preview, speechChunks, showDialog) = prepareSession(text: text)
+            Log.info("[TTS] speakDirect \(text.count) chars -> \(speechChunks.count) chunks")
             launchParallelFetches(chunks: speechChunks, api: api, voice: voice, model: model, showDialog: showDialog)
-
             let allWav = try await playFromCache(
-                startAt: 0, player: player, rate: rate, usage: usage,
-                preview: String(text.prefix(60)), showDialog: showDialog
+                startAt: 0, player: player, rate: rate, usage: usage, preview: preview, showDialog: showDialog
             )
             try Task.checkCancellation()
             if !allWav.isEmpty { history.saveTTSToHistory(text: text, ttsWavBytes: allWav) }
@@ -126,22 +96,19 @@ enum SpeechService {
         } catch is CancellationError {
             Log.info("[TTS] speakDirect cancelled")
         } catch {
-            Log.error("[TTS] speakDirect error: \(error)")
-            if ConfigManager.showTTSDialog { TTSDialog.shared.error(humanError(error)) }
+            handleError(error, tag: "TTS speakDirect", notify: false)
         }
     }
 
     static func resumeFromChunk(
         startAt: Int,
         api: GroqAPIClient, player: AudioPlayer, voice: String, model: String,
-        rate: Float, usage: UsageTracker
+        rate: Float, usage: UsageTracker,
+        startTime: TimeInterval = 0
     ) async {
-        guard let session = lastSession else {
-            Log.error("[TTS] resumeFromChunk: no session")
-            return
-        }
+        guard let session = lastSession else { Log.error("[TTS] resumeFromChunk: no session"); return }
         guard startAt >= 0, startAt < session.chunks.count else { return }
-        Log.info("[TTS] resumeFromChunk \(startAt) of \(session.chunks.count)")
+        Log.info("[TTS] resumeFromChunk \(startAt) of \(session.chunks.count) startTime=\(startTime)")
         player.reset()
 
         if fetchTasks.isEmpty {
@@ -151,21 +118,37 @@ enum SpeechService {
         do {
             _ = try await playFromCache(
                 startAt: startAt, player: player, rate: rate, usage: usage,
-                preview: String(session.text.prefix(60)), showDialog: true
+                preview: String(session.text.prefix(60)), showDialog: true, startTime: startTime
             )
             try Task.checkCancellation()
             if ConfigManager.showTTSDialog { TTSDialog.shared.finish() }
         } catch is CancellationError {
             Log.info("[TTS] resume cancelled")
         } catch {
-            Log.error("[TTS] resume error: \(error)")
-            if ConfigManager.showTTSDialog { TTSDialog.shared.error(humanError(error)) }
+            handleError(error, tag: "TTS resume", notify: false)
         }
     }
 
-    // MARK: - Parallel fetch
+    // MARK: - Session helpers
 
-    private static let maxConcurrent = 3
+    private static func prepareSession(text: String) -> (preview: String, speechChunks: [String], showDialog: Bool) {
+        let rawChunks = TextChunker.split(text)
+        let speechChunks = rawChunks.map { TextCleaner.clean($0) }
+        Log.info("[TTS] \(text.count) chars -> \(rawChunks.count) chunks")
+        let showDialog = ConfigManager.showTTSDialog
+        if showDialog { TTSDialog.shared.show(text: text, chunks: rawChunks) }
+        lastSession = LastSession(text: text, prettified: text, chunks: speechChunks)
+        return (String(text.prefix(60)), speechChunks, showDialog)
+    }
+
+    private static func handleError(_ error: Error, tag: String, notify: Bool) {
+        Log.error("[\(tag)] error: \(error)")
+        let short = humanError(error)
+        if notify { NotificationHelper.sendStatus("\u{274C} \(short)") }
+        if ConfigManager.showTTSDialog { TTSDialog.shared.error(short) }
+    }
+
+    // MARK: - Parallel fetch
 
     private static func launchParallelFetches(
         chunks: [String], api: GroqAPIClient, voice: String, model: String, showDialog: Bool
@@ -176,13 +159,10 @@ enum SpeechService {
         alignTasks.removeAll()
         Log.info("[TTS] launching \(chunks.count) fetches (max \(maxConcurrent) concurrent)")
 
-        let pending = chunks.enumerated().map { ($0.offset, $0.element) }
         var cursor = 0
-
         func launchNext() {
-            guard cursor < pending.count else { return }
-            let (i, chunk) = pending[cursor]
-            cursor += 1
+            guard cursor < chunks.count else { return }
+            let i = cursor; let chunk = chunks[cursor]; cursor += 1
             fetchTasks[i] = Task {
                 var lastError: Error?
                 for attempt in 1...2 {
@@ -190,7 +170,11 @@ enum SpeechService {
                         let data = try await api.speechData(text: chunk, voice: voice, model: model)
                         chunkAudio[i] = data
                         if showDialog {
-                            await MainActor.run { TTSDialog.shared.enableChunk(i) }
+                            let duration = wavDuration(data)
+                            await MainActor.run {
+                                TTSDialog.shared.enableChunk(i)
+                                TTSDialog.shared.setChunkDuration(i, duration: duration)
+                            }
                             launchAlignment(chunkIdx: i, wavData: data)
                         }
                         Log.debug("[TTS] chunk \(i) fetched (\(data.count) bytes)")
@@ -208,15 +192,9 @@ enum SpeechService {
                 throw lastError ?? NSError(domain: "TTS", code: -1)
             }
         }
-
-        for _ in 0..<min(maxConcurrent, chunks.count) {
-            launchNext()
-        }
+        for _ in 0..<min(maxConcurrent, chunks.count) { launchNext() }
     }
 
-    /// Fire off a background WordAligner request for a freshly-fetched chunk.
-    /// Alignment runs concurrently with audio playback and silently drops out
-    /// on failure (dialog simply falls back to chunk-level highlight).
     private static func launchAlignment(chunkIdx: Int, wavData: Data) {
         alignTasks[chunkIdx]?.cancel()
         alignTasks[chunkIdx] = Task.detached(priority: .utility) {
@@ -224,9 +202,7 @@ enum SpeechService {
                 let words = try await WordAligner.align(wavData: wavData)
                 if Task.isCancelled { return }
                 Log.debug("[ALIGN] chunk \(chunkIdx) -> \(words.count) words")
-                await MainActor.run {
-                    TTSDialog.shared.setChunkWords(chunkIdx, words: words)
-                }
+                await MainActor.run { TTSDialog.shared.setChunkWords(chunkIdx, words: words) }
             } catch is CancellationError {
                 // normal
             } catch {
@@ -239,7 +215,8 @@ enum SpeechService {
 
     private static func playFromCache(
         startAt: Int, player: AudioPlayer, rate: Float,
-        usage: UsageTracker, preview: String, showDialog: Bool
+        usage: UsageTracker, preview: String, showDialog: Bool,
+        startTime: TimeInterval = 0
     ) async throws -> Data {
         guard let session = lastSession else { return Data() }
         let chunks = session.chunks
@@ -248,48 +225,62 @@ enum SpeechService {
 
         for i in startAt..<chunks.count {
             try Task.checkCancellation()
-
             let wavData: Data
-            if let cached = chunkAudio[i] {
-                wavData = cached
-            } else if let task = fetchTasks[i] {
-                wavData = try await task.value
-            } else {
-                Log.error("[TTS] no fetch task for chunk \(i)")
-                break
-            }
-
+            if let cached = chunkAudio[i] { wavData = cached }
+            else if let task = fetchTasks[i] { wavData = try await task.value }
+            else { Log.error("[TTS] no fetch task for chunk \(i)"); break }
             guard !wavData.isEmpty else { break }
             try Task.checkCancellation()
 
             allWav.append(wavData)
             usage.logUsage(kind: "tts", chars: chunks[i].count)
-
-            NotificationHelper.sendStatus(
-                "\u{1F50A} Speaking \(i + 1)/\(chunks.count)...", subtitle: preview
-            )
+            NotificationHelper.sendStatus("\u{1F50A} Speaking \(i + 1)/\(chunks.count)...", subtitle: preview)
             if showDialog { TTSDialog.shared.setActiveChunk(i) }
 
-            // Start a 15 Hz playhead poller so the dialog can karaoke-highlight
-            // words as AVAudioPlayer advances through this chunk. Only runs
-            // while the TTS dialog is visible; otherwise it's a no-op loop.
+            // 15 Hz playhead poller for karaoke highlight; only while dialog visible.
             let pollerTask: Task<Void, Never>? = showDialog ? Task { [i, player] in
                 while !Task.isCancelled {
-                    let t = player.currentTime
-                    TTSDialog.shared.setChunkPlayhead(i, time: t)
-                    try? await Task.sleep(for: .milliseconds(66)) // ~15 Hz
+                    TTSDialog.shared.setChunkPlayhead(i, time: player.currentTime)
+                    try? await Task.sleep(for: .milliseconds(66))
                 }
             } : nil
 
-            await player.play(data: wavData, rate: rate)
+            // startTime applies only to first chunk (mid-chunk seek from word click).
+            let offset: TimeInterval = (i == startAt) ? startTime : 0
+            await player.play(data: wavData, rate: rate, startAt: offset)
             pollerTask?.cancel()
             if player.cancelled { break }
         }
-
         return allWav
     }
 
-    // MARK: - Errors
+    // MARK: - WAV duration / errors
+
+    /// Parse WAV header for duration in seconds. Returns 0 on malformed input.
+    private static func wavDuration(_ data: Data) -> TimeInterval {
+        guard data.count >= 44,
+              data[0] == 0x52, data[1] == 0x49, data[2] == 0x46, data[3] == 0x46,
+              data[8] == 0x57, data[9] == 0x41, data[10] == 0x56, data[11] == 0x45
+        else { return 0 }
+
+        func u32LE(at off: Int) -> UInt32 {
+            UInt32(data[off]) | (UInt32(data[off+1]) << 8)
+                | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
+        }
+        var byteRate: UInt32 = 0, dataSize: UInt32 = 0, off = 12
+        while off + 8 <= data.count {
+            let id0 = data[off], id1 = data[off+1], id2 = data[off+2], id3 = data[off+3]
+            let size = u32LE(at: off + 4)
+            if id0 == 0x66, id1 == 0x6D, id2 == 0x74, id3 == 0x20, off + 24 <= data.count {
+                byteRate = u32LE(at: off + 16)
+            } else if id0 == 0x64, id1 == 0x61, id2 == 0x74, id3 == 0x61 {
+                dataSize = size; break
+            }
+            off += 8 + Int(size)
+        }
+        guard byteRate > 0, dataSize > 0 else { return 0 }
+        return TimeInterval(dataSize) / TimeInterval(byteRate)
+    }
 
     private static func humanError(_ err: Error) -> String {
         let ns = err as NSError

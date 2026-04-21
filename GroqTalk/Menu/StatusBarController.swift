@@ -7,7 +7,6 @@ final class StatusBarController: NSObject {
     private weak var appDelegate: AppDelegate?
 
     private var stopItem: NSMenuItem!
-    private var enhanceItem: NSMenuItem!
     private var denoiseItem: NSMenuItem!
     private var dialogItem: NSMenuItem!
     private var sttSubmenu: NSMenu!
@@ -25,127 +24,85 @@ final class StatusBarController: NSObject {
         refreshCost()
     }
 
+    @discardableResult
+    private func add(_ title: String, action: Selector? = nil, key: String = "", submenu: NSMenu? = nil, to parent: NSMenu? = nil) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        if let sm = submenu { item.submenu = sm }
+        (parent ?? menu).addItem(item)
+        return item
+    }
+
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = ConfigManager.iconIdle
-
         menu = NSMenu()
         menu.autoenablesItems = false
 
-        let recordItem = NSMenuItem(title: "Speech \u{2192} Text  (Fn)", action: #selector(handleRecord), keyEquivalent: "")
-        recordItem.target = self
-        menu.addItem(recordItem)
-
-        let speakItem = NSMenuItem(title: "Speak Selection  (Ctrl+Option)", action: #selector(handleSpeak), keyEquivalent: "")
-        speakItem.target = self
-        menu.addItem(speakItem)
-
-        let liveDictationItem = NSMenuItem(title: "Live Dictation (Cmd+Shift+Space)", action: #selector(handleLiveDictation), keyEquivalent: "")
-        liveDictationItem.target = self
-        menu.addItem(liveDictationItem)
-
-        stopItem = NSMenuItem(title: "\u{23F9} Stop", action: #selector(handleStop), keyEquivalent: "")
-        stopItem.target = self
+        add("Speech \u{2192} Text  (Fn)", action: #selector(handleRecord))
+        add("Speak Selection  (Ctrl+Option)", action: #selector(handleSpeak))
+        add("Live Dictation (Cmd+Shift+Space)", action: #selector(handleLiveDictation))
+        stopItem = add("\u{23F9} Stop", action: #selector(handleStop))
         stopItem.isHidden = true
-        menu.addItem(stopItem)
-
         menu.addItem(.separator())
 
-        let audiosItem = NSMenuItem(title: "Recent Audios", action: nil, keyEquivalent: "")
-        audiosSubmenu = NSMenu()
-        audiosSubmenu.autoenablesItems = false
-        audiosItem.submenu = audiosSubmenu
-        menu.addItem(audiosItem)
-
-        let textsItem = NSMenuItem(title: "Recent Texts", action: nil, keyEquivalent: "")
-        textsSubmenu = NSMenu()
-        textsSubmenu.autoenablesItems = false
-        textsItem.submenu = textsSubmenu
-        menu.addItem(textsItem)
-
+        audiosSubmenu = makeSubmenu()
+        add("Recent Audios", submenu: audiosSubmenu)
+        textsSubmenu = makeSubmenu()
+        add("Recent Texts", submenu: textsSubmenu)
         buildHistoryItems()
-
         menu.addItem(.separator())
 
-        enhanceItem = NSMenuItem(title: "Enhance Text (LLM)", action: #selector(handleToggleEnhance), keyEquivalent: "")
-        enhanceItem.target = self
-        enhanceItem.state = .off
-        menu.addItem(enhanceItem)
-
-        denoiseItem = NSMenuItem(title: "Denoise Recording (experimental)", action: #selector(handleToggleDenoise), keyEquivalent: "")
-        denoiseItem.target = self
+        denoiseItem = add("Denoise Recording (experimental)", action: #selector(handleToggleDenoise))
         denoiseItem.state = ConfigManager.denoiseBeforeSTT ? .on : .off
-        menu.addItem(denoiseItem)
 
-        let sttItem = NSMenuItem(title: "STT Engine", action: nil, keyEquivalent: "")
-        sttSubmenu = NSMenu()
-        sttSubmenu.autoenablesItems = false
+        sttSubmenu = makeSubmenu()
         for entry in ConfigManager.sttModels {
-            let mi = NSMenuItem(title: entry.label, action: #selector(handleSetSTTMode(_:)), keyEquivalent: "")
-            mi.target = self
+            let mi = add(entry.label, action: #selector(handleSetSTTMode(_:)), to: sttSubmenu)
             mi.representedObject = entry.mode.rawValue
             mi.state = entry.mode == ConfigManager.defaultSTTMode ? .on : .off
-            sttSubmenu.addItem(mi)
         }
-        sttItem.submenu = sttSubmenu
-        menu.addItem(sttItem)
+        add("STT Engine", submenu: sttSubmenu)
 
-        let ttsItem = NSMenuItem(title: "TTS Engine", action: nil, keyEquivalent: "")
-        ttsSubmenu = NSMenu()
-        ttsSubmenu.autoenablesItems = false
+        ttsSubmenu = makeSubmenu()
         for entry in ConfigManager.ttsEngines {
-            let mi = NSMenuItem(title: entry.label, action: #selector(handleSetTTSEngine(_:)), keyEquivalent: "")
-            mi.target = self
+            let mi = add(entry.label, action: #selector(handleSetTTSEngine(_:)), to: ttsSubmenu)
             mi.representedObject = entry.engine.rawValue
             mi.state = entry.engine == ConfigManager.defaultTTSEngine ? .on : .off
-            ttsSubmenu.addItem(mi)
         }
-        ttsItem.submenu = ttsSubmenu
-        menu.addItem(ttsItem)
+        add("TTS Engine", submenu: ttsSubmenu)
 
-        let voiceItem = NSMenuItem(title: "Voice", action: nil, keyEquivalent: "")
-        voiceSubmenu = NSMenu()
-        voiceSubmenu.autoenablesItems = false
+        voiceSubmenu = makeSubmenu()
         rebuildVoiceSubmenu(for: ConfigManager.defaultTTSEngine)
-        voiceItem.submenu = voiceSubmenu
-        menu.addItem(voiceItem)
+        add("Voice", submenu: voiceSubmenu)
 
-        let speedItem = NSMenuItem(title: "Playback Speed", action: nil, keyEquivalent: "")
-        speedSubmenu = NSMenu()
-        speedSubmenu.autoenablesItems = false
+        speedSubmenu = makeSubmenu()
         for rate in ["0.75x", "1.0x", "1.25x", "1.5x", "1.75x", "2.0x"] {
-            let si = NSMenuItem(title: rate, action: #selector(handleSetSpeed(_:)), keyEquivalent: "")
-            si.target = self
+            let si = add(rate, action: #selector(handleSetSpeed(_:)), to: speedSubmenu)
             si.state = rate == "1.25x" ? .on : .off
-            speedSubmenu.addItem(si)
         }
-        speedItem.submenu = speedSubmenu
-        menu.addItem(speedItem)
+        add("Playback Speed", submenu: speedSubmenu)
 
-        dialogItem = NSMenuItem(title: "Show TTS Dialog", action: #selector(handleToggleDialog), keyEquivalent: "")
-        dialogItem.target = self
+        dialogItem = add("Show TTS Dialog", action: #selector(handleToggleDialog))
         dialogItem.state = ConfigManager.showTTSDialog ? .on : .off
-        menu.addItem(dialogItem)
-
-        costItem = NSMenuItem(title: "Usage: $0.00 (3 days)", action: #selector(handleRefreshCost), keyEquivalent: "")
-        costItem.target = self
-        menu.addItem(costItem)
-
+        costItem = add("Usage: $0.00 (3 days)", action: #selector(handleRefreshCost))
         menu.addItem(.separator())
-
-        let dictItem = NSMenuItem(title: "Edit Dictionary...", action: #selector(handleEditDictionary), keyEquivalent: "")
-        dictItem.target = self
-        menu.addItem(dictItem)
-
-        let apiKeyItem = NSMenuItem(title: "Set API Keys...", action: #selector(handleSetAPIKey), keyEquivalent: "")
-        apiKeyItem.target = self
-        menu.addItem(apiKeyItem)
-
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(handleQuit), keyEquivalent: "")
-        quitItem.target = self
-        menu.addItem(quitItem)
-
+        add("Edit Dictionary...", action: #selector(handleEditDictionary))
+        add("Quit", action: #selector(handleQuit))
         statusItem.menu = menu
+    }
+
+    private func makeSubmenu() -> NSMenu {
+        let sm = NSMenu()
+        sm.autoenablesItems = false
+        return sm
+    }
+
+    /// Radio-select within `submenu`: set .on where `match(item)` is true, .off elsewhere.
+    private func selectRadio(in submenu: NSMenu, match: (NSMenuItem) -> Bool) {
+        for i in 0..<submenu.numberOfItems {
+            if let item = submenu.item(at: i) { item.state = match(item) ? .on : .off }
+        }
     }
 
     // MARK: - Icon & Controls
@@ -161,19 +118,14 @@ final class StatusBarController: NSObject {
         DispatchQueue.main.async { [weak self] in self?.statusItem.button?.title = icon }
     }
 
-    /// Shown in the menu bar title when Secure Input is eating events — tells
-    /// the user at a glance why their hotkeys suddenly stopped working.
+    /// Shown in the menu bar title when Secure Input is eating events.
     func setSecureInputWarning(_ active: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            // Prefix the title with a lock emoji while Secure Input is on.
-            // Restored to the plain state icon when it turns off.
             let base = self.statusItem.button?.title ?? ConfigManager.iconIdle
             let stripped = base.hasPrefix("\u{1F512}") ? String(base.dropFirst()) : base
             self.statusItem.button?.title = active ? "\u{1F512}\(stripped)" : stripped
-            self.statusItem.button?.toolTip = active
-                ? "Secure Input is active — hotkeys paused by macOS. Dismiss any password field."
-                : nil
+            self.statusItem.button?.toolTip = active ? "Secure Input is active — hotkeys paused by macOS. Dismiss any password field." : nil
         }
     }
 
@@ -190,43 +142,32 @@ final class StatusBarController: NSObject {
     private func buildHistoryItems() {
         guard let delegate = appDelegate else { return }
         let entries = delegate.history.load()
-
         audiosSubmenu.removeAllItems()
         textsSubmenu.removeAllItems()
-
         var audioCount = 0
         for entry in entries.reversed() {
             guard let ttsPath = entry.ttsWavPath, FileManager.default.fileExists(atPath: ttsPath) else { continue }
             let ago = HistoryManager.relativeTime(entry.timestamp)
             let preview = String((entry.cleaned ?? "").prefix(40))
-            let item = NSMenuItem(title: "\(ago) -- \(preview)", action: #selector(handleReplaySpoken(_:)), keyEquivalent: "")
-            item.target = self
+            let item = add("\(ago) -- \(preview)", action: #selector(handleReplaySpoken(_:)), to: audiosSubmenu)
             item.representedObject = entry.cleaned ?? ""
-            audiosSubmenu.addItem(item)
             audioCount += 1
         }
         if audioCount == 0 { audiosSubmenu.addItem(NSMenuItem(title: "(none)", action: nil, keyEquivalent: "")) }
-
         var textCount = 0
-        // Show pending recordings first (failed transcriptions)
         for entry in entries.reversed() {
             guard entry.pending == true, entry.wavPath != nil else { continue }
             let ago = HistoryManager.relativeTime(entry.timestamp)
-            let item = NSMenuItem(title: "\u{1F504} \(ago) -- [tap to retry transcription]", action: #selector(handleRetryPending(_:)), keyEquivalent: "")
-            item.target = self
+            let item = add("\u{1F504} \(ago) -- [tap to retry transcription]", action: #selector(handleRetryPending(_:)), to: textsSubmenu)
             item.representedObject = entry.timestamp
-            textsSubmenu.addItem(item)
             textCount += 1
         }
-
         for entry in entries.reversed() {
             let text = entry.cleaned ?? entry.transcript
             guard let text, !text.isEmpty, entry.wavPath != nil else { continue }
             let ago = HistoryManager.relativeTime(entry.timestamp)
-            let item = NSMenuItem(title: "\(ago) -- \(String(text.prefix(40)))", action: #selector(handleReuseText(_:)), keyEquivalent: "")
-            item.target = self
+            let item = add("\(ago) -- \(String(text.prefix(40)))", action: #selector(handleReuseText(_:)), to: textsSubmenu)
             item.representedObject = text
-            textsSubmenu.addItem(item)
             textCount += 1
         }
         if textCount == 0 { textsSubmenu.addItem(NSMenuItem(title: "(none)", action: nil, keyEquivalent: "")) }
@@ -242,21 +183,17 @@ final class StatusBarController: NSObject {
         }
     }
 
-    // MARK: - API Key Dialog
+    // MARK: - Dictionary
 
     @objc private func handleEditDictionary(_ sender: NSMenuItem) {
-        // Disable event tap so keyboard works in the dialog
         appDelegate?.hotkeys.disableTap()
-
         NSApp.activate(ignoringOtherApps: true)
-
         let alert = NSAlert()
         alert.messageText = "Custom Dictionary"
         alert.informativeText = "Add words the STT should recognize (comma-separated).\nExample: Qwen, Groq, Svelte, Tauri"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-
         let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         textField.isEditable = true
         textField.isSelectable = true
@@ -265,86 +202,12 @@ final class StatusBarController: NSObject {
         textField.placeholderString = "Qwen, Groq, Svelte, Tauri"
         alert.accessoryView = textField
         alert.window.initialFirstResponder = textField
-
         let response = alert.runModal()
-
-        // Re-enable event tap
         appDelegate?.hotkeys.enableTap()
-
         guard response == .alertFirstButtonReturn else { return }
-
         let words = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         try? words.write(toFile: ConfigManager.dictionaryPath, atomically: true, encoding: .utf8)
         NotificationHelper.send(title: "GroqTalk", message: "Dictionary saved (\(words.components(separatedBy: ",").count) words)")
-    }
-
-    @objc private func handleSetAPIKey(_ sender: NSMenuItem) { promptAPIKey() }
-
-    func promptAPIKey() {
-        NSApp.activate(ignoringOtherApps: true)
-
-        let alert = NSAlert()
-        alert.messageText = "Set API Keys"
-        alert.informativeText = "Groq (STT) + OpenAI (TTS)"
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 120))
-
-        let groqLabel = NSTextField(labelWithString: "Groq API Key (STT):")
-        groqLabel.frame = NSRect(x: 0, y: 96, width: 340, height: 18)
-        container.addSubview(groqLabel)
-
-        // IMPORTANT: do NOT use NSSecureTextField here. When a secure field
-        // has focus, macOS engages system-wide Secure Input, which silently
-        // blocks EVERY CGEventTap on the machine — including our Ctrl+Option
-        // / Fn hotkey tap. An API key isn't a password that gets typed often;
-        // a plain NSTextField is the correct control and keeps hotkeys alive
-        // while the dialog is open. (See CLAUDE.md "Secure Input gotcha".)
-        let groqInput = NSTextField(frame: NSRect(x: 0, y: 70, width: 340, height: 24))
-        groqInput.placeholderString = "gsk_..."
-        container.addSubview(groqInput)
-
-        let openaiLabel = NSTextField(labelWithString: "OpenAI API Key (TTS):")
-        openaiLabel.frame = NSRect(x: 0, y: 40, width: 340, height: 18)
-        container.addSubview(openaiLabel)
-
-        let openaiInput = NSTextField(frame: NSRect(x: 0, y: 14, width: 340, height: 24))
-        openaiInput.placeholderString = "sk-..."
-        container.addSubview(openaiInput)
-
-        let envPath = ConfigManager.configDir + "/.env"
-        if let contents = try? String(contentsOfFile: envPath, encoding: .utf8) {
-            for line in contents.components(separatedBy: "\n") {
-                if line.hasPrefix("GROQ_API_KEY=") {
-                    groqInput.stringValue = String(line.dropFirst("GROQ_API_KEY=".count))
-                }
-                if line.hasPrefix("OPENAI_API_KEY=") {
-                    openaiInput.stringValue = String(line.dropFirst("OPENAI_API_KEY=".count))
-                }
-            }
-        }
-
-        alert.accessoryView = container
-        alert.window.initialFirstResponder = groqInput
-
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-
-        let groqKey = groqInput.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let openaiKey = openaiInput.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !groqKey.isEmpty else { return }
-
-        var envContent = "GROQ_API_KEY=\(groqKey)\n"
-        if !openaiKey.isEmpty { envContent += "OPENAI_API_KEY=\(openaiKey)\n" }
-
-        let dir = ConfigManager.configDir
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try? envContent.write(toFile: envPath, atomically: true, encoding: .utf8)
-
-        appDelegate?.reloadAPIKey()
-        NotificationHelper.send(title: "GroqTalk", message: "API keys saved!")
     }
 
     // MARK: - Actions
@@ -353,12 +216,6 @@ final class StatusBarController: NSObject {
     @objc private func handleSpeak(_ sender: NSMenuItem) { appDelegate?.speakSelected() }
     @objc private func handleLiveDictation(_ sender: NSMenuItem) { appDelegate?.toggleLiveDictation() }
     @objc private func handleStop(_ sender: NSMenuItem) { appDelegate?.stopAll() }
-
-    @objc private func handleToggleEnhance(_ sender: NSMenuItem) {
-        guard let d = appDelegate else { return }
-        d.enhanceText.toggle()
-        enhanceItem.state = d.enhanceText ? .on : .off
-    }
 
     @objc private func handleToggleDenoise(_ sender: NSMenuItem) {
         ConfigManager.denoiseBeforeSTT.toggle()
@@ -375,15 +232,10 @@ final class StatusBarController: NSObject {
         guard let d = appDelegate, let raw = sender.representedObject as? String,
               let mode = ConfigManager.STTMode(rawValue: raw) else { return }
         d.sttMode = mode
-        for i in 0..<sttSubmenu.numberOfItems {
-            sttSubmenu.item(at: i)?.state = sttSubmenu.item(at: i)?.representedObject as? String == raw ? .on : .off
-        }
-        // Stop all local servers first
+        selectRadio(in: sttSubmenu) { ($0.representedObject as? String) == raw }
         d.stopWhisperServer()
         d.stopMLXSTTServer()
-        // Start the right one
         switch mode {
-        case .groqCloud: break
         case .parakeet: break   // uses mlx_audio.server (already running for TTS)
         case .localSmall: d.startWhisperServer()
         case .localLarge: d.startMLXSTTServer()
@@ -393,9 +245,7 @@ final class StatusBarController: NSObject {
     @objc private func handleSetVoice(_ sender: NSMenuItem) {
         guard let voice = sender.representedObject as? String else { return }
         appDelegate?.currentVoice = voice
-        for i in 0..<voiceSubmenu.numberOfItems {
-            voiceSubmenu.item(at: i)?.state = voiceSubmenu.item(at: i)?.representedObject as? String == voice ? .on : .off
-        }
+        selectRadio(in: voiceSubmenu) { ($0.representedObject as? String) == voice }
     }
 
     @objc private func handleSetTTSEngine(_ sender: NSMenuItem) {
@@ -404,12 +254,9 @@ final class StatusBarController: NSObject {
         d.ttsEngine = engine
         let entry = ConfigManager.ttsEngineEntry(engine)
         d.currentVoice = entry.defaultVoice
-        for i in 0..<ttsSubmenu.numberOfItems {
-            ttsSubmenu.item(at: i)?.state = ttsSubmenu.item(at: i)?.representedObject as? String == raw ? .on : .off
-        }
+        selectRadio(in: ttsSubmenu) { ($0.representedObject as? String) == raw }
         rebuildVoiceSubmenu(for: engine)
         Log.info("[TTS] engine switched to \(entry.label) — model \(entry.model)")
-        // Evict prior model from RAM (16 GB Macs OOM otherwise).
         d.restartKokoroServer()
     }
 
@@ -418,28 +265,19 @@ final class StatusBarController: NSObject {
         let entry = ConfigManager.ttsEngineEntry(engine)
         let currentVoice = appDelegate?.currentVoice ?? entry.defaultVoice
         for voice in entry.voices {
-            let vi = NSMenuItem(title: voice, action: #selector(handleSetVoice(_:)), keyEquivalent: "")
-            vi.target = self
+            let vi = add(voice, action: #selector(handleSetVoice(_:)), to: voiceSubmenu)
             vi.representedObject = voice
             vi.state = voice == currentVoice ? .on : .off
-            voiceSubmenu.addItem(vi)
         }
     }
 
     @objc private func handleSetSpeed(_ sender: NSMenuItem) {
         let rate = Float(sender.title.replacingOccurrences(of: "x", with: "")) ?? 1.25
         appDelegate?.playbackRate = rate
-        for i in 0..<speedSubmenu.numberOfItems {
-            speedSubmenu.item(at: i)?.state = speedSubmenu.item(at: i)?.title == sender.title ? .on : .off
-        }
+        selectRadio(in: speedSubmenu) { $0.title == sender.title }
     }
 
     @objc private func handleRefreshCost(_ sender: NSMenuItem) { refreshCost() }
-
-    @objc private func handleReplayEntry(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String else { return }
-        appDelegate?.replayEntry(path: path)
-    }
 
     @objc private func handleReplaySpoken(_ sender: NSMenuItem) {
         guard let text = sender.representedObject as? String, !text.isEmpty else { return }

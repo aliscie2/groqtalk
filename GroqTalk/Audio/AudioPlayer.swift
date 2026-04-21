@@ -11,7 +11,7 @@ final class AudioPlayer: @unchecked Sendable {
     /// Current playback position of the active chunk (seconds). 0 when idle.
     var currentTime: TimeInterval { audioPlayer?.currentTime ?? 0 }
 
-    func play(data: Data, rate: Float = 1.0) async {
+    func play(data: Data, rate: Float = 1.0, startAt: TimeInterval = 0) async {
         lock.lock()
         if cancelled { lock.unlock(); return }
         lock.unlock()
@@ -26,6 +26,7 @@ final class AudioPlayer: @unchecked Sendable {
                     let player = try AVAudioPlayer(data: data)
                     player.enableRate = true
                     player.rate = rate
+                    if startAt > 0 { player.currentTime = startAt }
 
                     lock.lock()
                     audioPlayer = player
@@ -75,5 +76,17 @@ final class AudioPlayer: @unchecked Sendable {
         cancelled = false
         paused = false
         lock.unlock()
+    }
+
+    /// Seek within the currently-playing chunk. Returns true if the seek
+    /// landed (i.e. there was an active player); false means the caller
+    /// needs to spin up a fresh play() with startAt.
+    @discardableResult
+    func seek(to time: TimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let p = audioPlayer else { return false }
+        p.currentTime = max(0, time)
+        return true
     }
 }

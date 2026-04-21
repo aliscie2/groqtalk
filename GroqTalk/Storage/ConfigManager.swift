@@ -3,55 +3,51 @@ import Foundation
 struct ConfigManager {
     static var shared = ConfigManager()
 
-    var apiKey: String
-    var openAIKey: String
-
     static let sampleRate: Int = 16_000
     static let channels: Int = 1
-    static let whisperModel = "whisper-large-v3-turbo"
-    static let sttBaseURL = "http://127.0.0.1:8724"       // whisper.cpp (small)
-    static let sttLargeURL = "http://127.0.0.1:8725"     // mlx-whisper (large)
-    static let sttMLXAudioURL = "http://127.0.0.1:8723"  // mlx_audio.server (Parakeet; shared with TTS)
+
+    // Local-only endpoints. Every server is spawned by AppDelegate on launch.
+    static let sttBaseURL       = "http://127.0.0.1:8724"   // whisper.cpp (small)
+    static let sttLargeURL      = "http://127.0.0.1:8725"   // whisper.cpp (large)
+    static let sttMLXAudioURL   = "http://127.0.0.1:8723"   // mlx_audio.server (Parakeet; shared with TTS)
+    static let ttsBaseURL       = "http://127.0.0.1:8723"   // mlx_audio.server (Kokoro)
+
     static let parakeetModel = "mlx-community/parakeet-tdt-0.6b-v2"
 
-    enum STTMode: String { case groqCloud, parakeet, localSmall, localLarge }
+    enum STTMode: String { case parakeet, localSmall, localLarge }
     static let sttModels: [(mode: STTMode, label: String, path: String)] = [
-        (.groqCloud,  "Groq Cloud (fastest)",            ""),
-        (.parakeet,   "Parakeet (local, accurate)",      ""),  // HF repo; downloaded on first use
-        (.localSmall, "Local Whisper Small (fast)",      configDir + "/models/ggml-small.en.bin"),
-        (.localLarge, "Local Whisper Large (accurate)",  configDir + "/models/ggml-large-v3-turbo-q5_0.bin"),
+        (.parakeet,   "Parakeet TDT (fastest + most accurate)", ""),  // pulled on first use
+        (.localSmall, "Local Whisper Small",                    configDir + "/models/ggml-small.en.bin"),
+        (.localLarge, "Local Whisper Large",                    configDir + "/models/ggml-large-v3-turbo-q5_0.bin"),
     ]
 
     static let systemRAM: UInt64 = ProcessInfo.processInfo.physicalMemory
     static let systemRAMGB: Int = Int(systemRAM / (1024 * 1024 * 1024))
 
+    /// Pick the best STT default available on disk. Parakeet gets priority on
+    /// 16 GB+ Macs because mlx-audio pulls the model on first use and it beats
+    /// Whisper on English benchmarks (HF OpenASR leaderboard).
     static var defaultSTTMode: STTMode {
-        if systemRAMGB > 16 {
-            // 24GB+ Macs: use large model by default
-            let largePath = sttModels.first(where: { $0.mode == .localLarge })?.path ?? ""
-            if FileManager.default.fileExists(atPath: largePath) { return .localLarge }
+        if systemRAMGB >= 16 {
+            return .parakeet
         }
-        // 16GB or less: use small model
+        let smallPath = sttModels.first(where: { $0.mode == .localSmall })?.path ?? ""
+        if FileManager.default.fileExists(atPath: smallPath) { return .localSmall }
         return .localSmall
     }
-    static let llmModel = "llama-3.3-70b-versatile"
-    static let llmSystemPrompt = """
-        Fix the grammar, punctuation, and formatting of the following transcribed speech. \
-        Keep the original meaning. Return ONLY the cleaned text, nothing else. \
-        Do not add any commentary or explanation.
-        """
-    static let llmSkipWordLimit = 4
-    static let ttsBaseURL = "http://127.0.0.1:8723"
 
-    enum TTSEngine: String { case fast, qwen }
+    // MARK: - TTS
+
+    enum TTSEngine: String { case fast }
     static let ttsEngines: [(engine: TTSEngine, label: String, model: String, voices: [String], defaultVoice: String)] = [
-        (.fast, "Fast (Kokoro)", "mlx-community/Kokoro-82M-bf16",
+        // Kokoro-82M 8-bit — same perceptual quality as bf16, ~40% faster on
+        // M-series, ~50% less RAM. The only local TTS we ship with consistent
+        // preset voices out of the box. Fish / Qwen were tried and removed:
+        // Fish needs reference audio for voice consistency; Qwen's named
+        // speakers didn't produce the expected consistency in testing.
+        (.fast, "Kokoro", "mlx-community/Kokoro-82M-8bit",
          ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"],
          "af_heart"),
-        // Qwen3-TTS-12Hz 0.6B bf16 — multilingual + higher quality than Kokoro,
-        // smaller + faster than Chatterbox. Loads on first request (~1.83 GB).
-        (.qwen, "Quality (Qwen3-TTS)", "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
-         ["default"], "default"),
     ]
     static let defaultTTSEngine: TTSEngine = .fast
     static func ttsEngineEntry(_ engine: TTSEngine) -> (label: String, model: String, voices: [String], defaultVoice: String) {
@@ -111,48 +107,7 @@ struct ConfigManager {
         return path
     }()
 
-    private init() {
-        self.apiKey = ConfigManager.loadAPIKey()
-        self.openAIKey = ConfigManager.loadOpenAIKey()
-        Log.info("GROQ_API_KEY loaded: \(apiKey.isEmpty ? "NO" : "YES")")
-        Log.info("OPENAI_API_KEY loaded: \(openAIKey.isEmpty ? "NO" : "YES")")
-    }
-
-    static func loadAPIKey() -> String {
-        let paths = [
-            configDir + "/.env",
-            NSHomeDirectory() + "/.env"
-        ]
-        for path in paths {
-            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
-                for line in contents.components(separatedBy: "\n") {
-                    if line.hasPrefix("GROQ_API_KEY=") {
-                        let key = String(line.dropFirst("GROQ_API_KEY=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !key.isEmpty { return key }
-                    }
-                }
-            }
-        }
-        return ProcessInfo.processInfo.environment["GROQ_API_KEY"] ?? ""
-    }
-
-    static func loadOpenAIKey() -> String {
-        let paths = [
-            configDir + "/.env",
-            NSHomeDirectory() + "/.env"
-        ]
-        for path in paths {
-            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
-                for line in contents.components(separatedBy: "\n") {
-                    if line.hasPrefix("OPENAI_API_KEY=") {
-                        let key = String(line.dropFirst("OPENAI_API_KEY=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !key.isEmpty { return key }
-                    }
-                }
-            }
-        }
-        return ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? ""
-    }
+    private init() {}
 }
 
 // MARK: - Logging
@@ -186,21 +141,22 @@ extension DateFormatter {
 
 // MARK: - Notifications
 
+import AppKit
+import UserNotifications
+
 enum NotificationHelper {
     static func requestPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         Log.info("[NOTIFY] using NSUserNotificationCenter")
     }
-
-    static func send(title: String, subtitle: String = "", message: String) {
+    static func send(title: String = "GroqTalk", message: String) {
         DispatchQueue.main.async {
             let n = NSUserNotification()
             n.title = title
-            n.subtitle = subtitle
             n.informativeText = message
             NSUserNotificationCenter.default.deliver(n)
         }
     }
-
     static func sendStatus(_ message: String, subtitle: String = "") {
         DispatchQueue.main.async {
             let center = NSUserNotificationCenter.default
@@ -214,7 +170,6 @@ enum NotificationHelper {
             center.deliver(n)
         }
     }
-
     static func clearStatus() {
         DispatchQueue.main.async {
             let center = NSUserNotificationCenter.default
