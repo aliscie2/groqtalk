@@ -547,12 +547,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Quit
 
     func quit() {
+        Log.info("[QUIT] user requested quit")
         hotkeys.unregisterAll()
         recorder.stop()
         player.stop()
-        kokoroProcess?.terminate()
-        whisperProcess?.terminate()
-        mlxSTTProcess?.terminate()
-        NSApplication.shared.terminate(nil)
+
+        // SIGTERM first, then SIGKILL any subprocess that ignores it.
+        // mlx_audio.server sometimes wedges mid-model-load and won't honor SIGTERM,
+        // which used to leave the menu-bar Quit visibly unresponsive.
+        let children = [kokoroProcess, whisperProcess, mlxSTTProcess].compactMap { $0 }
+        for p in children { p.terminate() }
+
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
+            for p in children where p.isRunning {
+                kill(p.processIdentifier, SIGKILL)
+            }
+            _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
+                                 arguments: ["-9", "-f", "mlx_audio.server"])
+            _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
+                                 arguments: ["-9", "-f", "whisper-server"])
+        }
+
+        // terminate(nil) can stall if any window declines termination. Hard-exit
+        // after a 1s grace period so menu-bar Quit is always responsive.
+        DispatchQueue.main.async {
+            NSApplication.shared.terminate(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                Log.info("[QUIT] terminate(nil) stalled — exiting hard")
+                exit(0)
+            }
+        }
     }
 }

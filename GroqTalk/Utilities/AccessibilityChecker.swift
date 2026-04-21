@@ -10,17 +10,13 @@ enum AccessibilityChecker {
         let trusted = AXIsProcessTrusted()
         Log.info("Accessibility trusted: \(trusted)")
         if !trusted {
-            // Reset old permissions for this bundle ID so macOS prompts fresh
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            task.arguments = ["reset", "Accessibility", "com.groqtalk.app"]
-            try? task.run()
-            task.waitUntilExit()
-            Log.info("Reset old Accessibility permissions")
-
+            // Do NOT call `tccutil reset` here — it wipes the user's grant and
+            // creates an infinite re-grant loop across relaunches. TCC persists
+            // correctly as long as the app is signed with a stable identity
+            // (see build.sh + scripts/create-signing-cert.sh).
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
-            Log.info("Prompted user for Accessibility permission")
+            Log.info("Prompted user for Accessibility permission — grant it in System Settings, then relaunch")
         }
     }
 }

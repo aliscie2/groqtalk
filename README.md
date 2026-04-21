@@ -24,11 +24,15 @@ Voice-to-text and text-to-speech menubar app for macOS. Lives in your menu bar �
 git clone https://github.com/aliscie2/groqtalk.git
 cd groqtalk
 
-# 2. Build
+# 2. One-time: create a stable code-signing identity so macOS Accessibility
+#    permission survives every rebuild (see "Accessibility gotcha" below).
+bash scripts/create-signing-cert.sh
+
+# 3. Build
 chmod +x build.sh
 ./build.sh
 
-# 3. Run
+# 4. Run
 open build/GroqTalk.app
 ```
 
@@ -36,6 +40,14 @@ On first launch you'll need to:
 1. **Grant Accessibility** permission (System Settings → Privacy & Security → Accessibility → enable GroqTalk)
 2. **Grant Microphone** permission when prompted
 3. **Set your Groq API key** from the menubar icon → Settings
+
+### The Accessibility gotcha (if hotkeys stop working after a rebuild)
+
+Global hotkeys (Ctrl+Option speak, Fn record, Cmd+Shift+Space live dictation) require macOS Accessibility permission. Permission is bound to the **code-signing identity** of the binary — so if the app is ad-hoc signed (default `codesign -s -`), every rebuild mints a new identity and macOS silently invalidates your grant. Symptom: hotkey presses do nothing, log shows `Accessibility trusted: false` in a retry loop.
+
+The included `scripts/create-signing-cert.sh` creates a self-signed certificate called `GroqTalk Local` in your login keychain. `build.sh` then signs every build with that same cert, so the TCC grant persists across rebuilds indefinitely. Run the script **once**; `build.sh` auto-detects it.
+
+If hotkeys still don't fire after granting Accessibility: the running process caches the trust state at launch. Quit GroqTalk from the menubar and relaunch.
 
 ## Local STT Setup (Optional)
 
