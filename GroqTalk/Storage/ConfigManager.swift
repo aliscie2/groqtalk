@@ -40,12 +40,14 @@ struct ConfigManager {
 
     enum TTSEngine: String { case fast }
     static let ttsEngines: [(engine: TTSEngine, label: String, model: String, voices: [String], defaultVoice: String)] = [
-        // Kokoro-82M 8-bit — same perceptual quality as bf16, ~40% faster on
-        // M-series, ~50% less RAM. The only local TTS we ship with consistent
-        // preset voices out of the box. Fish / Qwen were tried and removed:
-        // Fish needs reference audio for voice consistency; Qwen's named
-        // speakers didn't produce the expected consistency in testing.
-        (.fast, "Kokoro", "mlx-community/Kokoro-82M-8bit",
+        // Kokoro-82M bf16 — consistent preset voices, fully on disk already.
+        // (8-bit variant is ~40% faster but is a separate HF repo; switching
+        // mid-session triggers a fresh multi-hundred-MB download that hangs
+        // every queued TTS request behind it. Upgrade only as a deliberate
+        // pre-downloaded swap.) Fish / Qwen were tried and removed: Fish
+        // needs reference audio for voice consistency; Qwen's named speakers
+        // didn't produce the expected consistency in testing.
+        (.fast, "Kokoro", "mlx-community/Kokoro-82M-bf16",
          ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"],
          "af_heart"),
     ]
