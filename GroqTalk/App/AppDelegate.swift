@@ -2,7 +2,6 @@ import AppKit
 import Carbon
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-
     // MARK: - Services
     let api = GroqAPIClient()
     let recorder = AudioRecorder()
@@ -18,30 +17,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - State
     enum AppState { case idle, recording, processing, speaking }
     var appState: AppState = .idle { didSet { statusBar?.updateIcon(appState) } }
-
     var sttMode: ConfigManager.STTMode = ConfigManager.defaultSTTMode
     var ttsEngine: ConfigManager.TTSEngine = ConfigManager.defaultTTSEngine
     var currentVoice = ConfigManager.ttsEngineEntry(ConfigManager.defaultTTSEngine).defaultVoice
     var playbackRate: Float = 1.25
     var currentTTSModel: String { ConfigManager.ttsEngineEntry(ttsEngine).model }
-
     private var sttTask: Task<Void, Never>?
     private var ttsTask: Task<Void, Never>?
     private var liveTask: Task<Void, Never>?
 
     // MARK: - Lifecycle
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         NotificationHelper.requestPermission()
         AccessibilityChecker.checkAndPrompt()
         statusBar = StatusBarController(delegate: self)
         setupHotkeys()
-
         // Any NSSecureTextField focus anywhere silently gags CGEventTap; the
         // monitor surfaces a lock icon so the cause is visible in under a sec.
-        SecureInputMonitor.shared.start { [weak self] active in
-            self?.statusBar.setSecureInputWarning(active)
-        }
+        SecureInputMonitor.shared.start { [weak self] in self?.statusBar.setSecureInputWarning($0) }
         SoundCue.prepare()
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
         TTSDialog.shared.onWordTap = { [weak self] idx, t in self?.jumpToWord(chunk: idx, time: t) }
@@ -51,23 +44,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             TTSDialog.shared.setPaused(self.player.paused)
         }
         TTSDialog.shared.onClose = { [weak self] in
-            self?.ttsTask?.cancel()
-            self?.player.stop()
-            self?.appState = .idle
-            self?.statusBar.setStopVisible(false)
+            self?.ttsTask?.cancel(); self?.player.stop()
+            self?.appState = .idle; self?.statusBar.setStopVisible(false)
             TTSDialog.shared.close()
         }
-
         ModelLifecycle.kokoroStart  = { [weak self] in self?.startKokoroServer() }
         ModelLifecycle.kokoroStop   = { [weak self] in self?.stopKokoroServer() }
         ModelLifecycle.whisperStart = { [weak self] in self?.startWhisperServer() }
         ModelLifecycle.whisperStop  = { [weak self] in self?.stopWhisperServer() }
-
         startKokoroServer()
         ModelLifecycle.markKokoroStarted()
         if sttMode == .localSmall {
-            startWhisperServer()
-            ModelLifecycle.markWhisperStarted()
+            startWhisperServer(); ModelLifecycle.markWhisperStarted()
         } else if sttMode == .localLarge {
             startMLXSTTServer()
         }
@@ -75,7 +63,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Server spawn (table-driven)
-
     /// Everything server-specific lives in `ServerSpec`; all shared plumbing
     /// (stdout redirect, termination handler, circuit-breaker auto-restart)
     /// lives in `run(_:)`.
@@ -88,7 +75,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let getProcess: () -> Process?
         let setProcess: (Process?) -> Void
     }
-
     private var restartWindows: [String: Date] = [:]
     private var restartCounts: [String: Int] = [:]
     private let maxRestartsPerWindow = 3
@@ -96,15 +82,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func run(_ spec: ServerSpec) {
         guard let proc = spec.launcher() else { return }
-
-        if !spec.logFile.isEmpty,
-           let fh = Self.truncatingLogHandle(at: spec.logFile) {
+        if !spec.logFile.isEmpty, let fh = Self.truncatingLogHandle(at: spec.logFile) {
             proc.standardOutput = fh; proc.standardError = fh
         } else {
             proc.standardOutput = FileHandle.nullDevice
             proc.standardError = FileHandle.nullDevice
         }
-
         proc.terminationHandler = { [weak self] p in
             Log.error("[\(spec.name)] server exited (code=\(p.terminationStatus))")
             DispatchQueue.main.async {
@@ -112,7 +95,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                       spec.getProcess()?.processIdentifier == p.processIdentifier else { return }
                 spec.setProcess(nil)
                 guard spec.shouldRestart() else { return }
-
                 let now = Date()
                 if now.timeIntervalSince(self.restartWindows[spec.name] ?? .distantPast) > self.restartWindowSec {
                     self.restartWindows[spec.name] = now
@@ -132,7 +114,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-
         do {
             try proc.run()
             spec.setProcess(proc)
@@ -149,10 +130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Port helpers
-
     /// SIGKILL (not SIGTERM — mid-model-load servers ignore SIGTERM for tens
-    /// of seconds, causing EADDRINUSE on the next spawn), then wait for the
-    /// port to actually free.
+    /// of seconds, causing EADDRINUSE on the next spawn), then wait for port.
     private func killExisting(pattern: String, port: UInt16) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
@@ -187,7 +166,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Kokoro TTS Server (8723)
-
     func startKokoroServer() {
         run(ServerSpec(
             name: "KOKORO", port: 8723,
@@ -207,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 var env = ProcessInfo.processInfo.environment
                 env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
                 proc.environment = env
-                // mlx_audio.server writes a logs/ dir in CWD; bundle CWD is EROFS.
+                // mlx_audio.server writes logs/ in CWD; bundle CWD is EROFS.
                 proc.currentDirectoryURL = URL(fileURLWithPath: ConfigManager.configDir)
                 return proc
             },
@@ -216,7 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
     }
 
-    /// Restart mlx_audio.server — evicts cached models (RAM relief on 16 GB).
+    /// Restart mlx_audio.server to evict cached models (RAM relief, 16 GB).
     func restartKokoroServer() {
         Log.info("[KOKORO] restarting to evict cached models")
         kokoroProcess?.terminate(); kokoroProcess = nil
@@ -231,9 +209,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Local Whisper STT Server (small, 8724)
-
     func startWhisperServer() {
-        if let proc = whisperProcess, proc.isRunning { proc.terminate(); whisperProcess = nil }
+        if let p = whisperProcess, p.isRunning { p.terminate(); whisperProcess = nil }
         run(ServerSpec(
             name: "WHISPER", port: 8724, logFile: "",
             shouldRestart: { false },
@@ -267,7 +244,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
     }
 
-    /// Map a GGML model filename to the whisper.cpp `--dtw` preset name.
     private func dtwPreset(forModelPath path: String) -> String {
         let n = (path as NSString).lastPathComponent.lowercased()
         if n.contains("large-v3") { return "large.v3" }
@@ -275,7 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if n.contains("large-v1") { return "large.v1" }
         if n.contains("large")    { return "large.v3" }
         if n.contains("medium.en") || n.contains("medium-en") { return "medium.en" }
-        if n.contains("medium")   { return "medium" }
+        if n.contains("medium")    { return "medium" }
         if n.contains("small.en") || n.contains("small-en") { return "small.en" }
         if n.contains("small")    { return "small" }
         if n.contains("base.en")  || n.contains("base-en")  { return "base.en" }
@@ -291,7 +267,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - MLX Whisper STT Server (large, 8725)
-
     func startMLXSTTServer() {
         guard mlxSTTProcess == nil || !mlxSTTProcess!.isRunning else {
             Log.info("[MLX-STT] already running"); return
@@ -327,7 +302,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Hotkeys
-
     private func setupHotkeys() {
         hotkeys.install()
         hotkeys.installModifierHotkeys(
@@ -338,7 +312,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Live Dictation
-
     func toggleLiveDictation() {
         if appState == .recording { stopLiveDictation() }
         else if appState == .idle { startLiveDictation() }
@@ -348,30 +321,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard appState == .idle else { return }
         if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         do {
-            try recorder.start()
-            SoundCue.recordStart()
-            appState = .recording
+            try recorder.start(); SoundCue.recordStart(); appState = .recording
             NotificationHelper.sendStatus("\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop")
             startLiveTranscription()
         } catch {
-            Log.error("[LIVE] failed to start: \(error)")
-            appState = .idle
+            Log.error("[LIVE] failed to start: \(error)"); appState = .idle
         }
     }
 
     private func stopLiveDictation() {
         guard appState == .recording else { return }
-        liveTask?.cancel()
-        SoundCue.recordStop()
-        _ = recorder.stop()
-        appState = .idle
-        statusBar.setStopVisible(false)
+        liveTask?.cancel(); SoundCue.recordStop(); _ = recorder.stop()
+        appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[LIVE] dictation stopped")
     }
 
     // MARK: - Recording (STT)
-
     func toggleRecording() {
         if appState == .recording { stopRecording() }
         else if appState == .idle { startRecording() }
@@ -381,24 +347,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard appState == .idle else { return }
         if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         do {
-            try recorder.start()
-            SoundCue.recordStart()
-            appState = .recording
+            try recorder.start(); SoundCue.recordStart(); appState = .recording
             NotificationHelper.sendStatus("\u{1F534} Recording... Press Fn to stop")
             startLiveTranscription()
         } catch {
-            Log.error("[REC] failed: \(error)")
-            appState = .idle
+            Log.error("[REC] failed: \(error)"); appState = .idle
         }
     }
 
     func stopRecording() {
         guard appState == .recording else { return }
-        liveTask?.cancel()
-        SoundCue.recordStop()
+        liveTask?.cancel(); SoundCue.recordStop()
         let buffers = recorder.stop()
-        appState = .processing
-        statusBar.setStopVisible(true)
+        appState = .processing; statusBar.setStopVisible(true)
         sttTask = Task { [weak self] in
             guard let self else { return }
             await TranscriptionService.process(
@@ -417,18 +378,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - TTS
-
     /// Shared tail for TTS tasks: drop back to idle + optionally refresh UI.
     @MainActor
     private func finishSpeech(refresh: Bool) {
         if !TTSDialog.shared.isVisible {
-            appState = .idle
-            statusBar.setStopVisible(false)
+            appState = .idle; statusBar.setStopVisible(false)
         }
-        if refresh {
-            statusBar.refreshHistory()
-            statusBar.refreshCost()
-        }
+        if refresh { statusBar.refreshHistory(); statusBar.refreshCost() }
     }
 
     /// Cancel in-flight TTS, stop player, warm kokoro, flip to speaking.
@@ -436,11 +392,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func beginSpeaking(requireIdle: Bool = false) -> Bool {
         if ttsEngine == .fast { ModelLifecycle.touchKokoro() }
-        ttsTask?.cancel()
-        player.stop()
+        ttsTask?.cancel(); player.stop()
         if requireIdle && appState != .idle { return false }
-        appState = .speaking
-        statusBar.setStopVisible(true)
+        appState = .speaking; statusBar.setStopVisible(true)
         return true
     }
 
@@ -476,16 +430,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func speakSelected() {
         Log.info("[TTS] speakSelected invoked (state=\(appState))")
         if appState == .speaking && player.paused {
-            player.togglePause()
-            TTSDialog.shared.setPaused(false)
-            statusBar.updateIcon(.speaking)
-            Log.info("[TTS] resumed"); return
+            player.togglePause(); TTSDialog.shared.setPaused(false)
+            statusBar.updateIcon(.speaking); Log.info("[TTS] resumed"); return
         }
         if appState == .speaking && !player.paused {
-            player.togglePause()
-            TTSDialog.shared.setPaused(true)
-            statusBar.updateIcon(.processing)
-            Log.info("[TTS] paused"); return
+            player.togglePause(); TTSDialog.shared.setPaused(true)
+            statusBar.updateIcon(.processing); Log.info("[TTS] paused"); return
         }
         guard beginSpeaking(requireIdle: true) else { return }
         ttsTask = Task { [weak self] in
@@ -499,25 +449,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Replay
-
     func replayRecording() {
         guard let entry = history.load().last, let path = entry.ttsWavPath else { return }
         replayEntry(path: path)
     }
 
     func replayEntry(path: String) {
-        ttsTask?.cancel()
-        player.stop()
-        appState = .speaking
-        statusBar.setStopVisible(true)
+        ttsTask?.cancel(); player.stop()
+        appState = .speaking; statusBar.setStopVisible(true)
         ttsTask = Task { [weak self] in
             guard let self else { return }
             if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
                 await player.play(data: data, rate: playbackRate)
             }
             await MainActor.run {
-                self.appState = .idle
-                self.statusBar.setStopVisible(false)
+                self.appState = .idle; self.statusBar.setStopVisible(false)
             }
         }
     }
@@ -534,8 +480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Retry pending recording
-
+    // MARK: - Retry
     func retryPending(timestamp: String) {
         if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         // Detached so stopAll() doesn't cancel it.
@@ -548,20 +493,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             await MainActor.run {
                 self.appState = .idle
-                self.statusBar.refreshHistory()
-                self.statusBar.refreshCost()
+                self.statusBar.refreshHistory(); self.statusBar.refreshCost()
             }
         }
     }
 
     // MARK: - Stop / Quit
-
     func stopAll() {
         sttTask?.cancel(); ttsTask?.cancel(); liveTask?.cancel()
         player.stop()
         if appState == .recording { _ = recorder.stop() }
-        appState = .idle
-        statusBar.setStopVisible(false)
+        appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[STOP] all stopped")
     }
@@ -571,13 +513,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// terminate(nil) can stall on any lingering window.
     func quit() {
         Log.info("[QUIT] user requested quit")
-        hotkeys.unregisterAll()
-        recorder.stop()
-        player.stop()
-
+        hotkeys.unregisterAll(); recorder.stop(); player.stop()
         let children = [kokoroProcess, whisperProcess, mlxSTTProcess].compactMap { $0 }
         for p in children { p.terminate() }
-
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
             for p in children where p.isRunning { kill(p.processIdentifier, SIGKILL) }
             _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
@@ -585,7 +523,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
                                  arguments: ["-9", "-f", "whisper-server"])
         }
-
         DispatchQueue.main.async {
             NSApplication.shared.terminate(nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
