@@ -40,6 +40,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AccessibilityChecker.checkAndPrompt()
         statusBar = StatusBarController(delegate: self)
         setupHotkeys()
+
+        // Watch for Secure Input (any NSSecureTextField focus anywhere on the
+        // system silently gags CGEventTap). Surfaces a lock icon + tooltip so
+        // the next time it happens the cause is visible in under a second.
+        SecureInputMonitor.shared.start { [weak self] active in
+            self?.statusBar.setSecureInputWarning(active)
+        }
         SoundCue.prepare()
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
         TTSDialog.shared.onPauseToggle = { [weak self] in
@@ -55,13 +62,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             TTSDialog.shared.close()
         }
 
-        if ConfigManager.shared.apiKey.isEmpty {
-            Log.info("No API key — prompting user")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.statusBar.promptAPIKey()
-            }
-        } else {
+        // 100% local by default. No cloud warmup, no auto-prompt.
+        // If the user wants cloud STT or grammar correction, they can add
+        // keys from the menu bar (Status → Set API Keys). Auto-prompting
+        // at launch used to open a modal NSAlert that blocked the main
+        // run loop, which meant the Ctrl+Option hotkey callback queued up
+        // behind it and only fired after the dialog closed — so the app
+        // appeared "broken" on every first run. Don't reintroduce this.
+        if !ConfigManager.shared.apiKey.isEmpty {
             warmConnection()
+        } else {
+            Log.info("[APP] running local-only (no API key set)")
         }
 
         // Register hot-swap handlers before spawning servers so the lifecycle
@@ -84,17 +95,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Kokoro TTS Server
 
-    /// Kill any existing mlx_audio.server (orphans from prior app runs) before spawning a fresh one.
+    // Circuit-breaker for the Kokoro auto-restart loop. If the server keeps
+    // dying within seconds of launch (e.g. port stuck in EADDRINUSE from an
+    // unkilled previous process), the naive "restart after 2s" loop pins a
+    // CPU core and fills the log. Cap it at 3 attempts per 30s.
+    private var kokoroRestartWindow: Date = .distantPast
+    private var kokoroRestartCount = 0
+    private let kokoroMaxRestartsPerWindow = 3
+    private let kokoroRestartWindowSec: TimeInterval = 30
+
+    /// Kill any existing mlx_audio.server (orphans from prior app runs) before
+    /// spawning a fresh one. SIGKILL rather than SIGTERM — a server that's
+    /// busy downloading or loading a 6 GB model will ignore SIGTERM for tens
+    /// of seconds, and any new spawn during that window fails with EADDRINUSE.
     private func killExistingKokoroServer() {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        task.arguments = ["-f", "mlx_audio.server"]
+        task.arguments = ["-9", "-f", "mlx_audio.server"]
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
         try? task.run()
         task.waitUntilExit()
-        // brief delay so the port frees
-        Thread.sleep(forTimeInterval: 0.5)
+        // Wait for port 8723 to actually free. pkill returns immediately but
+        // the kernel takes a moment to reap the socket; next bind can race.
+        waitForPortFree(8723, timeout: 4.0)
+    }
+
+    private func waitForPortFree(_ port: UInt16, timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if canBind(port: port) { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        Log.error("[KOKORO] port \(port) still busy after \(timeout)s — next spawn may fail")
+    }
+
+    private func canBind(port: UInt16) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        if sock < 0 { return false }
+        defer { close(sock) }
+        var reuse: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let ok = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { ptr in
+                Darwin.bind(sock, ptr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return ok == 0
     }
 
     func startKokoroServer() {
@@ -109,8 +160,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
+        // Inherit PATH so the script can reach /opt/homebrew (launchd strips it).
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        proc.environment = env
+        // mlx_audio.server writes a `logs/` directory in CWD on startup; the
+        // .app bundle CWD is read-only (EROFS). Pin CWD to a writable dir.
+        proc.currentDirectoryURL = URL(fileURLWithPath: ConfigManager.configDir)
+
+        // Redirect to a log we can read. Previously stdout+stderr went to
+        // /dev/null, which masked every crash cause including model-load OOM.
+        let logURL = URL(fileURLWithPath: ConfigManager.configDir + "/tts_server.log")
+        try? "".write(to: logURL, atomically: true, encoding: .utf8) // truncate per run
+        if let fh = try? FileHandle(forWritingTo: logURL) {
+            proc.standardOutput = fh
+            proc.standardError = fh
+        } else {
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+        }
+
+        // Observe unexpected exits. Auto-restart on crash, but circuit-break
+        // if the server is failing repeatedly in a short window (typical cause:
+        // port stuck in EADDRINUSE after an unkilled previous process).
+        proc.terminationHandler = { [weak self] p in
+            let code = p.terminationStatus
+            Log.error("[KOKORO] server exited (code=\(code)) — see tts_server.log")
+            DispatchQueue.main.async {
+                guard let self, self.kokoroProcess?.processIdentifier == p.processIdentifier else { return }
+                self.kokoroProcess = nil
+
+                let now = Date()
+                if now.timeIntervalSince(self.kokoroRestartWindow) > self.kokoroRestartWindowSec {
+                    self.kokoroRestartWindow = now
+                    self.kokoroRestartCount = 0
+                }
+                self.kokoroRestartCount += 1
+                if self.kokoroRestartCount > self.kokoroMaxRestartsPerWindow {
+                    Log.error("[KOKORO] \(self.kokoroRestartCount) crashes in \(Int(self.kokoroRestartWindowSec))s — giving up auto-restart")
+                    NotificationHelper.sendStatus("\u{274C} TTS server keeps crashing — see tts_server.log")
+                    return
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    guard let self, self.kokoroProcess == nil else { return }
+                    Log.info("[KOKORO] auto-restarting after crash (attempt \(self.kokoroRestartCount))")
+                    self.startKokoroServer()
+                }
+            }
+        }
 
         do {
             try proc.run()
@@ -407,6 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func speakSelected() {
+        Log.info("[TTS] speakSelected invoked (state=\(appState))")
         // If paused → resume
         if appState == .speaking && player.paused {
             player.togglePause()

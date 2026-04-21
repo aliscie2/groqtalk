@@ -1,3 +1,4 @@
+import AppKit
 import Carbon
 import CoreGraphics
 import Foundation
@@ -13,6 +14,7 @@ final class HotkeyService {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var retryTimer: Timer?
+    private var healthTimer: Timer?
 
     fileprivate static var fnCallback: (() -> Void)?
     fileprivate static var fnDown = false
@@ -48,15 +50,71 @@ final class HotkeyService {
         HotkeyService.fnCallback = fnAction
         HotkeyService.ctrlOptCallback = ctrlOptAction
 
-        if tryCreateTap() { return }
-
-        Log.info("[HOTKEY] Waiting for Accessibility — retrying every 3s")
-        retryTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] timer in
-            if self?.tryCreateTap() == true {
-                timer.invalidate()
-                self?.retryTimer = nil
+        _ = tryCreateTap()
+        if eventTap == nil {
+            Log.info("[HOTKEY] Waiting for permissions — retrying every 3s")
+            retryTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] timer in
+                if self?.tryCreateTap() == true {
+                    timer.invalidate()
+                    self?.retryTimer = nil
+                }
             }
         }
+
+        installHealthMonitor()
+    }
+
+    /// Self-heal the event tap against the known silent-death scenarios
+    /// (Stage Manager transitions, display sleep, login-window cycles).
+    /// See CLAUDE.md "Hotkey tap silent death" for the 2024–2026 macOS bugs
+    /// this guards against. Heartbeat + system notifications is strictly
+    /// additive — if the tap is healthy this does nothing.
+    private func installHealthMonitor() {
+        let nc = NSWorkspace.shared.notificationCenter
+        let selector = #selector(rebuildTapAfterSystemEvent)
+        nc.addObserver(self, selector: selector, name: NSWorkspace.didWakeNotification, object: nil)
+        nc.addObserver(self, selector: selector, name: NSWorkspace.screensDidWakeNotification, object: nil)
+        nc.addObserver(self, selector: selector, name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        nc.addObserver(self, selector: selector, name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.checkTapHealth()
+        }
+        if let t = healthTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+
+    @objc private func rebuildTapAfterSystemEvent() {
+        Log.info("[HOTKEY] system event — verifying tap health")
+        checkTapHealth(force: true)
+    }
+
+    private func checkTapHealth(force: Bool = false) {
+        guard let tap = eventTap else {
+            _ = tryCreateTap()
+            return
+        }
+        let enabled = CGEvent.tapIsEnabled(tap: tap)
+        if !enabled {
+            Log.info("[HOTKEY] tap disabled — re-enabling")
+            CGEvent.tapEnable(tap: tap, enable: true)
+            if !CGEvent.tapIsEnabled(tap: tap) {
+                Log.info("[HOTKEY] re-enable failed — rebuilding from scratch")
+                teardownTap()
+                _ = tryCreateTap()
+            }
+        } else if force {
+            // After a system transition the tap can *report* enabled but
+            // stop delivering events. Rebuild defensively.
+            teardownTap()
+            _ = tryCreateTap()
+        }
+    }
+
+    private func teardownTap() {
+        if let src = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
+        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
+        eventTap = nil
+        runLoopSource = nil
     }
 
     private func tryCreateTap() -> Bool {
@@ -112,15 +170,14 @@ final class HotkeyService {
 
     func unregisterAll() {
         retryTimer?.invalidate()
+        healthTimer?.invalidate()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         for ref in hotkeyRefs { UnregisterEventHotKey(ref) }
         hotkeyRefs.removeAll()
         HotkeyService.callbacks.removeAll()
         HotkeyService.fnCallback = nil
         HotkeyService.ctrlOptCallback = nil
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let src = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
-        eventTap = nil
-        runLoopSource = nil
+        teardownTap()
     }
 }
 
@@ -175,10 +232,13 @@ private func modifierCallback(
         if both && !HotkeyService.ctrlOptDown {
             HotkeyService.ctrlOptDown = true
             HotkeyService.ctrlOptDirtied = hasCmd || hasShift || hasFn
+            Log.debug("[HOTKEY] ctrl+opt DOWN (dirtied=\(HotkeyService.ctrlOptDirtied))")
         } else if HotkeyService.ctrlOptDown && both && (hasCmd || hasShift || hasFn) {
             HotkeyService.ctrlOptDirtied = true
         } else if HotkeyService.ctrlOptDown && !both {
             HotkeyService.ctrlOptDown = false
+            let willFire = !HotkeyService.ctrlOptDirtied && HotkeyService.ctrlOptCallback != nil
+            Log.debug("[HOTKEY] ctrl+opt UP (dirtied=\(HotkeyService.ctrlOptDirtied), fire=\(willFire))")
             if !HotkeyService.ctrlOptDirtied, let cb = HotkeyService.ctrlOptCallback {
                 DispatchQueue.main.async { cb() }
             }

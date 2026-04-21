@@ -43,12 +43,14 @@ struct ConfigManager {
     static let llmSkipWordLimit = 4
     static let ttsBaseURL = "http://127.0.0.1:8723"
 
-    enum TTSEngine: String { case fast, chatterbox }
+    enum TTSEngine: String { case fast, qwen }
     static let ttsEngines: [(engine: TTSEngine, label: String, model: String, voices: [String], defaultVoice: String)] = [
         (.fast, "Fast (Kokoro)", "mlx-community/Kokoro-82M-bf16",
          ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"],
          "af_heart"),
-        (.chatterbox, "High Quality (Chatterbox)", "mlx-community/chatterbox-turbo-fp16",
+        // Qwen3-TTS-12Hz 0.6B bf16 — multilingual + higher quality than Kokoro,
+        // smaller + faster than Chatterbox. Loads on first request (~1.83 GB).
+        (.qwen, "Quality (Qwen3-TTS)", "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
          ["default"], "default"),
     ]
     static let defaultTTSEngine: TTSEngine = .fast

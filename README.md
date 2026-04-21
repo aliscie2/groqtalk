@@ -41,13 +41,14 @@ On first launch you'll need to:
 2. **Grant Microphone** permission when prompted
 3. **Set your Groq API key** from the menubar icon → Settings
 
-### The Accessibility gotcha (if hotkeys stop working after a rebuild)
+### Hotkey troubleshooting (if Ctrl+Option / Fn do nothing)
 
-Global hotkeys (Ctrl+Option speak, Fn record, Cmd+Shift+Space live dictation) require macOS Accessibility permission. Permission is bound to the **code-signing identity** of the binary — so if the app is ad-hoc signed (default `codesign -s -`), every rebuild mints a new identity and macOS silently invalidates your grant. Symptom: hotkey presses do nothing, log shows `Accessibility trusted: false` in a retry loop.
+If global hotkeys stop working, the problem is almost always one of these four, in decreasing order of likelihood. Check `~/.config/groqtalk/groqtalk.log`.
 
-The included `scripts/create-signing-cert.sh` creates a self-signed certificate called `GroqTalk Local` in your login keychain. `build.sh` then signs every build with that same cert, so the TCC grant persists across rebuilds indefinitely. Run the script **once**; `build.sh` auto-detects it.
-
-If hotkeys still don't fire after granting Accessibility: the running process caches the trust state at launch. Quit GroqTalk from the menubar and relaunch.
+1. **Secure Input mode.** If a password-style text field has keyboard focus *anywhere on the system* (1Password auto-type, Terminal "Secure Keyboard Entry", sudo prompt, an open password dialog), macOS silently gags every CGEventTap — GroqTalk's included. The menu-bar icon shows a 🔒 prefix and the log shows `[SECURE-INPUT] transitioned to true`. Close the password field and hotkeys return instantly.
+2. **Missing permissions.** Grant both **Accessibility** AND **Input Monitoring** in System Settings → Privacy & Security. Input Monitoring is a separate service from Accessibility; GroqTalk prompts for both but you have to accept both. Log at startup shows `Accessibility trusted: true | Input Monitoring: true` when correct.
+3. **Rebuild without stable signing.** If you skipped `scripts/create-signing-cert.sh`, every rebuild is ad-hoc signed and macOS silently revokes your TCC grant. Run the script once, rebuild, re-grant once, done forever. Verify with `codesign -dvv /Applications/GroqTalk.app | grep Authority` — should be `GroqTalk Local`, not `(ad-hoc)`.
+4. **Stale cache after system event.** `AXIsProcessTrusted()` is per-process cached. If you granted permissions to an already-running app, quit from the menu bar and relaunch. The app also self-heals the tap on wake-from-sleep and space changes, but if it ever stops responding: `pkill -9 -f GroqTalk.app && open /Applications/GroqTalk.app`.
 
 ## Local STT Setup (Optional)
 

@@ -1,5 +1,14 @@
 # CLAUDE.md — notes for future Claude sessions
 
+## "Global hotkey does nothing" — triage checklist
+
+**When a user says Ctrl+Option / Fn / Cmd+Shift+Space doesn't work, check these four things in order.** They account for ~100% of hotkey failures we've seen, and each one looks like "the hotkey is broken" from the user's perspective.
+
+1. **Secure Input is active.** `grep SECURE-INPUT ~/.config/groqtalk/groqtalk.log`. If `transitioned to true` appears and you don't see a matching `false`, a password field somewhere on the system is gagging every CGEventTap (ours, everyone's). Ask the user to close any open password/API-key prompt. `ps -E | grep _SECURE_INPUT` identifies the culprit process. **This repo used to trigger it on itself** — the API-key dialog was an NSSecureTextField. Now it's NSTextField (`GroqTalk/Menu/StatusBarController.swift`), but any other app (1Password auto-type, Terminal "Secure Keyboard Entry", sudo prompt) can still turn it on.
+2. **Stable signing missing.** `codesign -dvv /Applications/GroqTalk.app | grep Authority` must show `Authority=GroqTalk Local`. If it shows `(ad-hoc)`, every rebuild invalidates the TCC grant — see "Accessibility / TCC" below.
+3. **TCC permissions.** Log should show `Accessibility trusted: true | Input Monitoring: true` at startup. If either is false, grant in System Settings → Privacy & Security. **Input Monitoring is a SEPARATE permission from Accessibility** on macOS 10.15+; the app prompts for both via `AccessibilityChecker.checkAndPrompt()`. Tap creation succeeds even without Input Monitoring — it just delivers zero events, which looks identical to the hotkey being "broken".
+4. **Tap silently died.** Log should show `[HOTKEY] Fn + Ctrl+Option tap installed!`. If it's there but no `ctrl+opt DOWN` ever follows a real keypress, the tap stopped delivering events without firing tapDisabled (known macOS bug after Stage Manager toggles / display sleep). The `HotkeyService.installHealthMonitor()` heartbeat + wake/space-change observers rebuild the tap; if they fail, `pkill -9 -f GroqTalk.app && open /Applications/GroqTalk.app` is the sledgehammer.
+
 ## Accessibility / TCC — the single most important gotcha
 
 **Symptom:** User reports a global hotkey (Ctrl+Option, Fn, Cmd+Shift+Space) does nothing. The log shows `Accessibility trusted: false` and then `[HOTKEY] Waiting for Accessibility — retrying every 3s` with no further events.

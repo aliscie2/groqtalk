@@ -12,7 +12,7 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
     private var webView: WKWebView?
     private var fadeOutWorkItem: DispatchWorkItem?
 
-    private let panelWidth: CGFloat = 640
+    private let panelWidth: CGFloat = 720
     private let corner: CGFloat = 18
 
     // MARK: - Public API
@@ -219,8 +219,8 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
       html, body {
         background: rgba(38, 40, 48, 0.94);
         font-family: -apple-system, "SF Pro Rounded", "Helvetica Neue", sans-serif;
-        font-size: 18px;
-        line-height: 1.7;
+        font-size: 22px;
+        line-height: 1.65;
         color: rgba(255,255,255, 0.55);
         padding: 40px 32px 28px 32px;
         overflow-y: auto;

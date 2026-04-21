@@ -161,6 +161,22 @@ final class StatusBarController: NSObject {
         DispatchQueue.main.async { [weak self] in self?.statusItem.button?.title = icon }
     }
 
+    /// Shown in the menu bar title when Secure Input is eating events — tells
+    /// the user at a glance why their hotkeys suddenly stopped working.
+    func setSecureInputWarning(_ active: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // Prefix the title with a lock emoji while Secure Input is on.
+            // Restored to the plain state icon when it turns off.
+            let base = self.statusItem.button?.title ?? ConfigManager.iconIdle
+            let stripped = base.hasPrefix("\u{1F512}") ? String(base.dropFirst()) : base
+            self.statusItem.button?.title = active ? "\u{1F512}\(stripped)" : stripped
+            self.statusItem.button?.toolTip = active
+                ? "Secure Input is active — hotkeys paused by macOS. Dismiss any password field."
+                : nil
+        }
+    }
+
     func setStopVisible(_ visible: Bool) {
         DispatchQueue.main.async { [weak self] in self?.stopItem.isHidden = !visible }
     }
@@ -280,7 +296,13 @@ final class StatusBarController: NSObject {
         groqLabel.frame = NSRect(x: 0, y: 96, width: 340, height: 18)
         container.addSubview(groqLabel)
 
-        let groqInput = NSSecureTextField(frame: NSRect(x: 0, y: 70, width: 340, height: 24))
+        // IMPORTANT: do NOT use NSSecureTextField here. When a secure field
+        // has focus, macOS engages system-wide Secure Input, which silently
+        // blocks EVERY CGEventTap on the machine — including our Ctrl+Option
+        // / Fn hotkey tap. An API key isn't a password that gets typed often;
+        // a plain NSTextField is the correct control and keeps hotkeys alive
+        // while the dialog is open. (See CLAUDE.md "Secure Input gotcha".)
+        let groqInput = NSTextField(frame: NSRect(x: 0, y: 70, width: 340, height: 24))
         groqInput.placeholderString = "gsk_..."
         container.addSubview(groqInput)
 
@@ -288,7 +310,7 @@ final class StatusBarController: NSObject {
         openaiLabel.frame = NSRect(x: 0, y: 40, width: 340, height: 18)
         container.addSubview(openaiLabel)
 
-        let openaiInput = NSSecureTextField(frame: NSRect(x: 0, y: 14, width: 340, height: 24))
+        let openaiInput = NSTextField(frame: NSRect(x: 0, y: 14, width: 340, height: 24))
         openaiInput.placeholderString = "sk-..."
         container.addSubview(openaiInput)
 
