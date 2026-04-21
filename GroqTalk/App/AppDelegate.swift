@@ -242,6 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard appState == .idle else { return }
         do {
             try recorder.start(); SoundCue.recordStart(); appState = .recording
+            RecordingIndicator.shared.show()
             NotificationHelper.sendStatus("\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop")
             startLiveTranscription()
         } catch {
@@ -252,6 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func stopLiveDictation() {
         guard appState == .recording else { return }
         liveTask?.cancel(); SoundCue.recordStop(); _ = recorder.stop()
+        RecordingIndicator.shared.hide()
         appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[LIVE] dictation stopped")
@@ -267,6 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard appState == .idle else { return }
         do {
             try recorder.start(); SoundCue.recordStart(); appState = .recording
+            RecordingIndicator.shared.show()
             NotificationHelper.sendStatus("\u{1F534} Recording... Press Fn to stop")
             startLiveTranscription()
         } catch {
@@ -277,6 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func stopRecording() {
         guard appState == .recording else { return }
         liveTask?.cancel(); SoundCue.recordStop()
+        RecordingIndicator.shared.hide()
         let buffers = recorder.stop()
         appState = .processing; statusBar.setStopVisible(true)
         sttTask = Task { [weak self] in
