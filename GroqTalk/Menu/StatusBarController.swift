@@ -233,13 +233,7 @@ final class StatusBarController: NSObject {
               let mode = ConfigManager.STTMode(rawValue: raw) else { return }
         d.sttMode = mode
         selectRadio(in: sttSubmenu) { ($0.representedObject as? String) == raw }
-        d.stopWhisperServer()
-        d.stopMLXSTTServer()
-        switch mode {
-        case .parakeet: break   // uses mlx_audio.server (already running for TTS)
-        case .localSmall: d.startWhisperServer()
-        case .localLarge: d.startMLXSTTServer()
-        }
+        // Only one STT engine now (Parakeet); it rides on the Kokoro server.
     }
 
     @objc private func handleSetVoice(_ sender: NSMenuItem) {

@@ -6,35 +6,26 @@ struct ConfigManager {
     static let sampleRate: Int = 16_000
     static let channels: Int = 1
 
-    // Local-only endpoints. Every server is spawned by AppDelegate on launch.
-    static let sttBaseURL       = "http://127.0.0.1:8724"   // whisper.cpp (small)
-    static let sttLargeURL      = "http://127.0.0.1:8725"   // whisper.cpp (large)
-    static let sttMLXAudioURL   = "http://127.0.0.1:8723"   // mlx_audio.server (Parakeet; shared with TTS)
-    static let ttsBaseURL       = "http://127.0.0.1:8723"   // mlx_audio.server (Kokoro)
+    // Local-only endpoints. mlx_audio.server hosts both Kokoro TTS and
+    // Parakeet STT on the same port (8723) — they're serialized by the
+    // _MLX_INFERENCE_LOCK patch in mlx_audio/server.py (backport of PR #594).
+    static let sttMLXAudioURL   = "http://127.0.0.1:8723"
+    static let ttsBaseURL       = "http://127.0.0.1:8723"
 
     static let parakeetModel = "mlx-community/parakeet-tdt-0.6b-v2"
 
-    enum STTMode: String { case parakeet, localSmall, localLarge }
+    // English-only local STT. Parakeet-TDT beats Whisper-large on the HF
+    // OpenASR English leaderboard AND runs ~60–120× real-time on M-series,
+    // so there's no reason to keep the Whisper fallbacks around.
+    enum STTMode: String { case parakeet }
     static let sttModels: [(mode: STTMode, label: String, path: String)] = [
-        (.parakeet,   "Parakeet TDT (fastest + most accurate)", ""),  // pulled on first use
-        (.localSmall, "Local Whisper Small",                    configDir + "/models/ggml-small.en.bin"),
-        (.localLarge, "Local Whisper Large",                    configDir + "/models/ggml-large-v3-turbo-q5_0.bin"),
+        (.parakeet, "Parakeet TDT", ""),
     ]
 
     static let systemRAM: UInt64 = ProcessInfo.processInfo.physicalMemory
     static let systemRAMGB: Int = Int(systemRAM / (1024 * 1024 * 1024))
 
-    /// Pick the best STT default available on disk. Parakeet gets priority on
-    /// 16 GB+ Macs because mlx-audio pulls the model on first use and it beats
-    /// Whisper on English benchmarks (HF OpenASR leaderboard).
-    static var defaultSTTMode: STTMode {
-        if systemRAMGB >= 16 {
-            return .parakeet
-        }
-        let smallPath = sttModels.first(where: { $0.mode == .localSmall })?.path ?? ""
-        if FileManager.default.fileExists(atPath: smallPath) { return .localSmall }
-        return .localSmall
-    }
+    static var defaultSTTMode: STTMode { .parakeet }
 
     // MARK: - TTS
 

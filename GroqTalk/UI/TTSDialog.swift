@@ -5,7 +5,6 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
     static let shared = TTSDialog()
 
     var onChunkTap: ((Int) -> Void)?
-    var onWordTap: ((Int, TimeInterval) -> Void)?
     var onClose: (() -> Void)?
     var onPauseToggle: (() -> Void)?
 
@@ -25,33 +24,11 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     func enableChunk(_ index: Int) { js("enableChunk(\(index))") }
 
-    /// Inform the dialog how long (seconds) chunk `index`'s audio is so
-    /// click-to-seek can map word positions proportionally before whisper
-    /// alignment arrives.
-    func setChunkDuration(_ index: Int, duration: TimeInterval) {
-        js("setChunkDuration(\(index), \(duration))")
-    }
-
     func setPaused(_ paused: Bool) { js("setPaused(\(paused))") }
 
     func setActiveChunk(_ index: Int) {
         Log.debug("[DIALOG] setActiveChunk \(index)")
         js("highlight(\(index))")
-    }
-
-    /// Supply word-level timestamps (from whisper.cpp `verbose_json`) for
-    /// karaoke highlighting once `setChunkPlayhead` is called.
-    func setChunkWords(_ index: Int, words: [WordAligner.Word]) {
-        let payload = words.map { ["t": $0.text, "s": $0.start, "e": $0.end] as [String: Any] }
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let json = String(data: data, encoding: .utf8) else { return }
-        js("setChunkWords(\(index), \(json))")
-    }
-
-    /// Current playback position (seconds) for the active chunk. Call at
-    /// ~15 Hz during playback to drive the `.word-active` class swap.
-    func setChunkPlayhead(_ index: Int, time: TimeInterval) {
-        js("setChunkPlayhead(\(index), \(time))")
     }
 
     func finish() {
@@ -173,18 +150,6 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
             "jump": { [weak self] b in
                 if let i = b["index"] as? Int { Log.info("[DIALOG] JS jump \(i)"); self?.onChunkTap?(i) }
             },
-            "wordTap": { [weak self] b in
-                if let c = b["chunk"] as? Int, let t = b["time"] as? Double {
-                    Log.info("[DIALOG] JS wordTap chunk=\(c) t=\(String(format: "%.2f", t))")
-                    self?.onWordTap?(c, t)
-                }
-            },
-            "wordsWrapped": { b in
-                Log.info("[DIALOG] wrapped \(b["total"] as? Int ?? 0) words across \(b["chunks"] as? Int ?? 0) chunks")
-            },
-            "chunkFallback": { b in
-                Log.info("[DIALOG] click missed word, chunk fallback → \(b["chunk"] as? Int ?? -1)")
-            },
             "close": { [weak self] _ in Log.info("[DIALOG] JS close"); self?.onClose?() },
             "pause": { [weak self] _ in Log.info("[DIALOG] JS pause toggle"); self?.onPauseToggle?() },
         ]
@@ -196,52 +161,119 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
     private static let htmlTemplate = """
     <!DOCTYPE html><html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1"><style>
+    :root{
+      --bg-panel:#1A1A1C;
+      --bg-elevated:#222225;
+      --text-body:rgba(232,230,225,.86);
+      --text-active:rgba(245,243,238,1);
+      --text-done:rgba(232,230,225,.38);
+      --text-muted:rgba(232,230,225,.54);
+      --accent:#E8B468;
+      --rule:rgba(232,230,225,.08);
+    }
     *{box-sizing:border-box;margin:0;padding:0}
-    html,body{background:rgba(38,40,48,.94);font-family:-apple-system,"SF Pro Rounded","Helvetica Neue",sans-serif;font-size:22px;line-height:1.65;color:rgba(255,255,255,.55);padding:40px 32px 28px;overflow-y:auto;overflow-x:hidden;-webkit-font-smoothing:antialiased;user-select:none;cursor:default}
+    html,body{background:var(--bg-panel);
+      font-family:"Iowan Old Style","Charter","Georgia",ui-serif,serif;
+      font-size:20px;line-height:1.55;letter-spacing:.005em;
+      color:var(--text-body);
+      padding:48px 56px 36px;overflow-y:auto;overflow-x:hidden;
+      -webkit-font-smoothing:antialiased;user-select:none;cursor:default}
     body::-webkit-scrollbar{width:0}
-    .top-controls{position:fixed;top:10px;left:14px;display:flex;gap:6px;z-index:100}
-    .ctrl-btn{width:24px;height:24px;border-radius:50%;border:none;background:rgba(255,255,255,.08);color:rgba(255,255,255,.5);font-size:11px;line-height:24px;text-align:center;cursor:pointer;transition:all .12s;padding:0}
-    .ctrl-btn:hover{background:rgba(255,255,255,.18);color:#fff}
-    .ctrl-btn.close{font-size:14px}
-    .ctrl-btn.close:hover{background:rgba(255,90,90,.7)}
-    .chunk{border-radius:6px;padding:4px 8px;margin:2px -8px;transition:all .15s ease;display:block}
+    #content{max-width:62ch;margin:0 auto}
+
+    /* Chunks: continuous prose, separated only by whitespace + accent bar. */
+    .chunk{display:block;margin:1.2em 0;padding-left:18px;margin-left:-20px;
+      border-left:2px solid transparent;transition:color 180ms ease,border-color 180ms ease}
     .chunk.enabled{cursor:pointer}
-    .chunk.enabled:hover{background:rgba(255,255,255,.06)}
-    .chunk.disabled{opacity:.4;cursor:default}
-    .chunk.active{color:#fff;font-weight:500;background:rgba(196,181,253,.15);border-left:3px solid rgba(196,181,253,.7);padding-left:12px;opacity:1}
-    .chunk.done{color:rgba(255,255,255,.72);opacity:1}
-    .finished .chunk{color:rgba(255,255,255,.88);font-weight:normal;background:none;border-left:none;padding-left:8px;opacity:1}
-    strong{font-weight:600}em{font-style:italic}
-    code{font-family:"SF Mono","JetBrains Mono",monospace;font-size:.88em;background:rgba(255,255,255,.08);padding:1px 5px;border-radius:4px}
-    h1,h2,h3{color:rgba(255,255,255,.9);font-weight:600;margin-top:4px}
-    h1{font-size:1.4em}h2{font-size:1.2em}h3{font-size:1.05em}
-    pre{overflow-x:auto;margin:4px 0}
-    pre code{display:block;padding:10px 14px;font-size:13px;line-height:1.4;white-space:pre}
-    .table-wrap{overflow-x:auto;margin:6px 0;-webkit-overflow-scrolling:touch}
-    table{min-width:100%;border-collapse:collapse;font-size:15px;white-space:nowrap}
-    th,td{padding:6px 12px;text-align:left;border-bottom:1px solid rgba(255,255,255,.1)}
-    th{color:rgba(255,255,255,.85);font-weight:600;border-bottom:2px solid rgba(255,255,255,.2)}
-    .chunk.list-item{padding-left:20px;position:relative}
-    .chunk.list-item::before{content:'\\2022';position:absolute;left:6px;color:rgba(196,181,253,.6)}
-    .chunk.header-chunk{font-size:1.15em;font-weight:600;color:rgba(255,255,255,.75);padding-top:8px}
-    .chunk.header-chunk.active{color:#fff}
-    .chunk.code-chunk{font-family:"SF Mono","JetBrains Mono",monospace;font-size:.82em;background:rgba(255,255,255,.04);border-radius:8px;padding:10px 14px;line-height:1.5;white-space:pre-wrap}
-    .chunk.table-header{color:rgba(196,181,253,.8);font-weight:600;font-size:.85em;text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid rgba(196,181,253,.2);padding-bottom:6px;margin-bottom:2px}
+    .chunk.enabled:hover{color:var(--text-active)}
+    .chunk.disabled{color:var(--text-done)}
+    .chunk.active{color:var(--text-active);border-left-color:var(--accent);background:linear-gradient(90deg,rgba(232,180,104,.08),transparent 92%);border-radius:4px}
+    .chunk.done{color:var(--text-done);transition:color 220ms ease}
+    .finished .chunk{color:var(--text-body);border-left-color:transparent}
+
+    /* Markdown */
+    strong{color:var(--text-active);font-weight:600}
+    em{font-style:italic}
+    h1,h2,h3{font-family:-apple-system,"SF Pro Text",system-ui,sans-serif;
+      line-height:1.25;color:var(--text-active)}
+    h1{font-size:28px;font-weight:600;margin:1.6em 0 .5em}
+    h2{font-size:22px;font-weight:600;margin:1.4em 0 .4em}
+    h3{font-size:18px;font-weight:600;margin:1.2em 0 .3em;color:var(--text-muted)}
+    code{font-family:"SF Mono","JetBrains Mono",ui-monospace,monospace;
+      font-size:.88em;background:var(--bg-elevated);padding:2px 6px;border-radius:4px}
+    pre{background:var(--bg-elevated);padding:14px 16px;border-radius:8px;
+      overflow-x:auto;margin:1em 0}
+    pre code{display:block;font-size:14px;line-height:1.5;padding:0;background:transparent}
+    blockquote{border-left:2px solid var(--rule);padding-left:14px;
+      color:var(--text-muted);font-style:italic;margin:1em 0}
+    ul,ol{padding-left:1.4em;margin:.8em 0}
+    li{margin:.25em 0}
+    hr{border:0;border-top:1px solid var(--rule);margin:1.6em 0}
+
+    /* Table rendering (pipe / box input converted to real tables). */
+    .table-wrap{overflow-x:auto;margin:1em 0}
+    table{border-collapse:collapse;font-size:.92em;font-family:-apple-system,system-ui,sans-serif}
+    th,td{padding:6px 12px;border-bottom:1px solid var(--rule);text-align:left}
+    th{color:var(--text-active);font-weight:600}
+
+    /* Special chunk types kept lean — no background cards. */
+    .chunk.header-chunk{font-family:-apple-system,"SF Pro Text",system-ui,sans-serif;
+      font-size:22px;font-weight:600;color:var(--text-muted)}
+    .chunk.header-chunk.active{color:var(--text-active)}
+    .chunk.code-chunk{font-family:"SF Mono","JetBrains Mono",ui-monospace,monospace;
+      font-size:14px;background:var(--bg-elevated);padding:12px 16px;border-radius:8px;
+      white-space:pre-wrap;line-height:1.5}
+    .chunk.list-item{padding-left:1.4em;position:relative;margin-left:0}
+    .chunk.list-item::before{content:'\\2022';position:absolute;left:.4em;color:var(--accent);opacity:.7}
     .kv-row{display:flex;gap:10px;padding:3px 0;align-items:baseline}
-    .kv-key{color:rgba(196,181,253,.85);font-weight:600;font-size:.82em;text-transform:uppercase;letter-spacing:.5px;min-width:60px;flex-shrink:0}
-    .kv-val{color:rgba(255,255,255,.88)}
-    .chunk.table-row{border-left:2px solid rgba(196,181,253,.25);padding-left:14px;margin-left:-4px}
-    .chunk.table-row.active{border-left:3px solid rgba(196,181,253,.7)}
-    .error{color:#fca5a5;font-weight:500;text-align:center;padding:20px}
-    .w{cursor:pointer;border-radius:3px;transition:background .08s}
-    .w:hover{background:rgba(255,255,255,.08)}
-    .word-active{background:rgba(196,181,253,.35);color:#fff;padding:1px 3px}
+    .kv-key{color:var(--accent);font-weight:600;font-size:.82em;text-transform:uppercase;
+      letter-spacing:.5px;min-width:60px;flex-shrink:0}
+    .kv-val{color:var(--text-body)}
+
+    /* Controls auto-hide; reveal on mousemove. Kindle-style. */
+    .top-controls{position:fixed;top:14px;right:14px;display:flex;gap:6px;z-index:100;
+      opacity:0;transition:opacity 160ms ease}
+    body.mouse-active .top-controls{opacity:1}
+    .ctrl-btn{width:28px;height:28px;border-radius:50%;border:none;
+      background:rgba(255,255,255,.06);color:var(--text-muted);
+      font-size:13px;line-height:28px;text-align:center;cursor:pointer;
+      transition:all 120ms ease;padding:0}
+    .ctrl-btn:hover{background:rgba(255,255,255,.14);color:var(--text-active)}
+    .ctrl-btn.close{font-size:16px}
+
+    .error{color:#fca5a5;font-weight:500;text-align:center;padding:20px;
+      font-family:-apple-system,system-ui,sans-serif}
+
+    /* Thin amber progress bar across the bottom — peripheral, non-clinical. */
+    #prog{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);
+      height:2px;width:140px;background:var(--rule);border-radius:1px}
+    #prog::after{content:'';display:block;height:100%;width:var(--p,0%);
+      background:var(--accent);border-radius:1px;transition:width 220ms ease}
+
+    /* Respect macOS Reduce Motion + Increase Contrast. */
+    @media (prefers-reduced-motion: reduce){
+      .chunk,.chunk.done,#prog::after{transition:none!important}
+      html{scroll-behavior:auto}
+    }
+    @media (prefers-contrast: more){
+      :root{--text-body:rgba(245,243,238,.96);--rule:rgba(232,230,225,.25)}
+    }
     </style></head><body>
     <div class="top-controls">
       <button class="ctrl-btn close" onclick="post('close')" title="Close (Esc)">&times;</button>
       <button class="ctrl-btn" id="pauseBtn" onclick="post('pause')" title="Pause/Resume (Ctrl+Option)">&#9208;</button>
     </div>
     <div id="content"></div>
+    <div id="prog"></div>
+    <script>
+    // Auto-hide top controls: show on mouse movement, hide after 1.8s idle.
+    (function(){
+      let t; document.body.classList.add('mouse-active');
+      const kick=()=>{document.body.classList.add('mouse-active');
+        clearTimeout(t);t=setTimeout(()=>document.body.classList.remove('mouse-active'),1800);};
+      document.addEventListener('mousemove',kick);kick();
+    })();
+    </script>
     <script>
     const BOX=/[\\u2500-\\u257F]/, VBAR='\\u2502', ARROW='\\u2192';
     const post=(action,extra)=>window.webkit.messageHandlers.tts.postMessage(Object.assign({action},extra||{}));
@@ -249,7 +281,19 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
     const inlineMd=s=>esc(s).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>').replace(/\\*([^*]+)\\*/g,'<em>$1</em>');
     const nonEmpty=s=>s.split('\\n').filter(l=>l.trim());
     function isPipeTable(s){const ls=nonEmpty(s);return ls.length>=2 && ls.filter(l=>l.indexOf('|')>=0).length>=2;}
-    function isKVChunk(s){const ls=nonEmpty(s);if(!ls.length)return false;const n=ls.filter(l=>/^[^:]{1,40}: .+/.test(l.trim())).length;return n===ls.length&&n>=1;}
+    // Only fire when EVERY line is "Key: value" and there are at least 2 lines.
+    // A single "Note: something" line in prose should not be styled as KV.
+    function isKVChunk(s){const ls=nonEmpty(s);if(ls.length<2)return false;
+      return ls.every(l=>/^[^:]{1,40}: .+/.test(l.trim()));}
+    // Only fire on a SINGLE-LINE chunk whose tokens between `sep` are all
+    // short labels (no sentence prose). Used to detect "A → B → C" rows
+    // without misclassifying sentences that happen to contain a → mid-text.
+    function isTokenRow(s,sep){const t=s.trim();
+      if(t.indexOf('\\n')>=0)return false;
+      const parts=t.split(sep).map(p=>p.trim()).filter(Boolean);
+      if(parts.length<2)return false;
+      // Every segment must be short (≤28 chars) and contain no end-of-sentence punctuation.
+      return parts.every(p=>p.length<=28 && !/[.!?]/.test(p));}
     function renderPipeTable(s){const ls=nonEmpty(s);let html='<div class="table-wrap"><table>',hdrDone=false;
       for(let i=0;i<ls.length;i++){const line=ls[i].trim();
         if(/^[|\\s:\\-]+$/.test(line)){hdrDone=true;continue;}
@@ -273,8 +317,8 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
         .replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>').replace(/\\*([^*]+)\\*/g,'<em>$1</em>').replace(/\\n/g,'<br>');}
     function chunkType(c){const t=c.trim();
       if(isKVChunk(t))return 'table-row';
-      if(t.indexOf(VBAR)>=0&&t.split(VBAR).length>=2)return 'table-header';
-      if(t.indexOf(ARROW)>=0&&t.split(ARROW).length>=2)return 'table-row';
+      if(isTokenRow(t,VBAR))return 'table-header';
+      if(isTokenRow(t,ARROW))return 'table-row';
       if(/^#{1,3} /.test(t))return 'header-chunk';
       if(/^[-*] /.test(t)||/^\\d{1,3}[\\.\\)] /.test(t))return 'list-item';
       if(t.startsWith('```'))return 'code-chunk';
@@ -282,37 +326,6 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     let activeIdx=-1;
     const enabledSet=new Set();
-    const chunkWords={};      // whisper-aligned [{t,s,e},...] per chunk
-    const chunkDuration={};   // seconds per chunk (from WAV fetch)
-    const activeWordSpan={};  // currently-lit span per chunk
-    function setChunkDuration(i,d){chunkDuration[i]=d;}
-
-    // Walk text nodes, wrap whitespace-separated tokens in <span class="w" data-wi=N>.
-    // Recurses into inline children (<code>, <strong>) but skips <pre>/<table>.
-    function wrapChunkWords(el){
-      if(!el||el.dataset.wrapped==='1')return 0;
-      let n=0;
-      const walk=(node)=>{
-        if(node.nodeType===Node.TEXT_NODE){
-          const text=node.nodeValue;
-          if(!text||!text.trim())return;
-          const frag=document.createDocumentFragment();
-          for(const p of text.split(/(\\s+)/)){
-            if(!p)continue;
-            if(/^\\s+$/.test(p))frag.appendChild(document.createTextNode(p));
-            else{const s=document.createElement('span');s.className='w';s.dataset.wi=String(n++);s.textContent=p;frag.appendChild(s);}
-          }
-          node.parentNode.replaceChild(frag,node);
-        }else if(node.nodeType===Node.ELEMENT_NODE){
-          if(node.tagName==='PRE'||node.tagName==='TABLE')return;
-          Array.from(node.childNodes).forEach(walk);
-        }
-      };
-      Array.from(el.childNodes).forEach(walk);
-      el.dataset.wrapped='1';
-      el.dataset.wcount=String(n);
-      return n;
-    }
 
     function loadChunks(chunks){
       const el=document.getElementById('content');
@@ -321,34 +334,12 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
       activeIdx=-1;
       el.innerHTML=chunks.map((c,i)=>{
         const ct=chunkType(c);
-        return '<div class="chunk disabled'+(ct?' '+ct:'')+'" data-i="'+i+'">'+md(c)+'</div>';
+        return '<div class="chunk disabled'+(ct?' '+ct:'')+'" data-i="'+i+'" onclick="tryJump('+i+')">'+md(c)+'</div>';
       }).join('');
-      // Wrap words immediately so clicks work before whisper alignment arrives.
-      // Use PROPORTIONAL seek (wi/wcount * duration) because TextCleaner expands
-      // "URL" → "U R L" etc, so aligned[] word count diverges from DOM wrap count
-      // — indexing aligned[wi] would produce wrong-seek (click word 10, hear 4).
-      let total=0;
-      document.querySelectorAll('.chunk').forEach(chunkEl=>{
-        const i=parseInt(chunkEl.dataset.i);
-        total+=wrapChunkWords(chunkEl);
-        chunkEl.addEventListener('click',ev=>{
-          const span=ev.target.closest('.w');
-          if(span){
-            const wi=parseInt(span.dataset.wi);
-            const wcount=parseInt(chunkEl.dataset.wcount)||1;
-            const dur=chunkDuration[i];
-            const t=(dur&&wcount>0)?(wi/wcount)*dur:wi*0.25;
-            ev.stopPropagation();
-            post('wordTap',{chunk:i,time:t});
-          }else{
-            // Fallback path — if you see this for a clearly-on-word click,
-            // wrapChunkWords didn't produce spans for that chunk.
-            post('chunkFallback',{chunk:i});
-            tryJump(i);
-          }
-        });
-      });
-      post('wordsWrapped',{total:total,chunks:chunks.length});
+      // Per-word click-to-seek and karaoke highlighting were removed: Kokoro
+      // doesn't emit native timestamps, and re-running whisper or extrapolating
+      // from character weights is a trick. Clicking a chunk still jumps to
+      // that chunk (chunk boundaries ARE accurate — they're the audio split).
     }
 
     function enableChunk(i){
@@ -359,14 +350,20 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     function highlight(i){
       document.querySelectorAll('.chunk.active').forEach(e=>e.classList.remove('active'));
-      document.querySelectorAll('.chunk').forEach(e=>{
+      const all=document.querySelectorAll('.chunk');
+      all.forEach(e=>{
         const idx=parseInt(e.dataset.i);
         if(idx<i){e.classList.add('done');e.classList.remove('disabled');e.classList.add('enabled');}
         else e.classList.remove('done');
       });
       const el=document.querySelector('[data-i="'+i+'"]');
       if(el){el.classList.add('active');el.classList.remove('disabled');el.classList.add('enabled');
-        el.scrollIntoView({behavior:'smooth',block:'center'});}
+        const sm=matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth';
+        el.scrollIntoView({behavior:sm,block:'center'});}
+      // Progress bar — fraction of chunks completed.
+      const total=Math.max(1,all.length-1);
+      const prog=document.getElementById('prog');
+      if(prog)prog.style.setProperty('--p',(i/total*100)+'%');
       activeIdx=i;
     }
 
@@ -379,26 +376,6 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     function showError(msg){
       document.getElementById('content').innerHTML='<div class="error">\\u26A0\\uFE0F  '+msg+'</div>';
-    }
-
-    // Words were wrapped at loadChunks — this just supplies refined timings.
-    function setChunkWords(i,words){chunkWords[i]=words||[];}
-
-    function setChunkPlayhead(i,t){
-      const words=chunkWords[i];
-      if(!words||!words.length)return;
-      const el=document.querySelector('[data-i="'+i+'"]');
-      if(!el)return;
-      let idx=-1;
-      for(let k=0;k<words.length;k++){if(t>=words[k].s&&t<words[k].e){idx=k;break;}}
-      const prev=activeWordSpan[i];
-      if(prev&&prev.dataset.wi===String(idx))return;
-      if(prev)prev.classList.remove('word-active');
-      if(idx>=0){
-        const span=el.querySelector('.w[data-wi="'+idx+'"]');
-        if(span){span.classList.add('word-active');activeWordSpan[i]=span;return;}
-      }
-      activeWordSpan[i]=null;
     }
 
     function tryJump(i){

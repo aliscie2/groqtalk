@@ -11,8 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let usage = UsageTracker()
     var statusBar: StatusBarController!
     private var kokoroProcess: Process?
-    private var whisperProcess: Process?
-    private var mlxSTTProcess: Process?
 
     // MARK: - State
     enum AppState { case idle, recording, processing, speaking }
@@ -37,7 +35,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SecureInputMonitor.shared.start { [weak self] in self?.statusBar.setSecureInputWarning($0) }
         SoundCue.prepare()
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
-        TTSDialog.shared.onWordTap = { [weak self] idx, t in self?.jumpToWord(chunk: idx, time: t) }
         TTSDialog.shared.onPauseToggle = { [weak self] in
             guard let self else { return }
             self.player.togglePause()
@@ -50,16 +47,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         ModelLifecycle.kokoroStart  = { [weak self] in self?.startKokoroServer() }
         ModelLifecycle.kokoroStop   = { [weak self] in self?.stopKokoroServer() }
-        ModelLifecycle.whisperStart = { [weak self] in self?.startWhisperServer() }
-        ModelLifecycle.whisperStop  = { [weak self] in self?.stopWhisperServer() }
         startKokoroServer()
         ModelLifecycle.markKokoroStarted()
-        if sttMode == .localSmall {
-            startWhisperServer(); ModelLifecycle.markWhisperStarted()
-        } else if sttMode == .localLarge {
-            startMLXSTTServer()
+        // Parakeet STT rides on the same mlx_audio.server as Kokoro, no
+        // separate process to spawn. The serialization lock in server.py
+        // prevents TTS/STT concurrent-eval crashes.
+
+        // Pre-warm Kokoro ~2s after launch so the first real TTS request
+        // doesn't pay cold-start cost (~0.5-1.2s on M5 Max per mlx-audio).
+        Task.detached(priority: .utility) { [api] in
+            try? await Task.sleep(for: .seconds(2))
+            _ = try? await api.speechData(
+                text: ".",
+                voice: ConfigManager.ttsEngineEntry(ConfigManager.defaultTTSEngine).defaultVoice,
+                model: ConfigManager.ttsEngineEntry(ConfigManager.defaultTTSEngine).model
+            )
+            Log.info("[TTS] pre-warm complete")
         }
-        Log.info("GroqTalk started — Fn (Record) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue) | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
+        Log.info("GroqTalk started — Fn (Record) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: parakeet | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
     }
 
     // MARK: - Server spawn (table-driven)
@@ -123,10 +128,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Returns an append-mode handle so we keep any Python traceback from a
+    /// previous crashing process. Previously we truncated on every spawn,
+    /// which wiped the evidence before debugging could read it.
     private static func truncatingLogHandle(at path: String) -> FileHandle? {
         let url = URL(fileURLWithPath: path)
-        try? "".write(to: url, atomically: true, encoding: .utf8)
-        return try? FileHandle(forWritingTo: url)
+        if !FileManager.default.fileExists(atPath: path) {
+            try? "".write(to: url, atomically: true, encoding: .utf8)
+        }
+        guard let fh = try? FileHandle(forWritingTo: url) else { return nil }
+        fh.seekToEndOfFile()
+        let marker = "\n--- \(Date()) respawn ---\n"
+        fh.write(marker.data(using: .utf8) ?? Data())
+        return fh
     }
 
     // MARK: - Port helpers
@@ -208,99 +222,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.info("[KOKORO] server stopped (idle unload)")
     }
 
-    // MARK: - Local Whisper STT Server (small, 8724)
-    func startWhisperServer() {
-        if let p = whisperProcess, p.isRunning { p.terminate(); whisperProcess = nil }
-        run(ServerSpec(
-            name: "WHISPER", port: 8724, logFile: "",
-            shouldRestart: { false },
-            launcher: { [weak self] in
-                guard let self,
-                      let entry = ConfigManager.sttModels.first(where: { $0.mode == self.sttMode })
-                else { return nil }
-                let modelPath = entry.path
-                guard FileManager.default.fileExists(atPath: modelPath) else {
-                    Log.error("[WHISPER] model not found at \(modelPath)")
-                    NotificationHelper.sendStatus("\u{274C} Whisper model not found"); return nil
-                }
-                let bin = "/opt/homebrew/bin/whisper-server"
-                guard FileManager.default.fileExists(atPath: bin) else {
-                    Log.error("[WHISPER] whisper-server not found"); return nil
-                }
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: bin)
-                // --dtw + --max-len 1 + --split-on-word + --word-thold give
-                // per-word segments for karaoke highlighting in TTSDialog.
-                proc.arguments = [
-                    "--model", modelPath, "--host", "127.0.0.1", "--port", "8724",
-                    "--language", "en", "--no-timestamps", "--flash-attn", "-bs", "1",
-                    "--dtw", self.dtwPreset(forModelPath: modelPath),
-                    "--max-len", "1", "--split-on-word", "--word-thold", "0.01"
-                ]
-                return proc
-            },
-            getProcess: { [weak self] in self?.whisperProcess },
-            setProcess: { [weak self] p in self?.whisperProcess = p }
-        ))
-    }
-
-    private func dtwPreset(forModelPath path: String) -> String {
-        let n = (path as NSString).lastPathComponent.lowercased()
-        if n.contains("large-v3") { return "large.v3" }
-        if n.contains("large-v2") { return "large.v2" }
-        if n.contains("large-v1") { return "large.v1" }
-        if n.contains("large")    { return "large.v3" }
-        if n.contains("medium.en") || n.contains("medium-en") { return "medium.en" }
-        if n.contains("medium")    { return "medium" }
-        if n.contains("small.en") || n.contains("small-en") { return "small.en" }
-        if n.contains("small")    { return "small" }
-        if n.contains("base.en")  || n.contains("base-en")  { return "base.en" }
-        if n.contains("base")     { return "base" }
-        if n.contains("tiny.en")  || n.contains("tiny-en")  { return "tiny.en" }
-        if n.contains("tiny")     { return "tiny" }
-        return "small.en"
-    }
-
-    func stopWhisperServer() {
-        whisperProcess?.terminate(); whisperProcess = nil
-        Log.info("[WHISPER] server stopped")
-    }
-
-    // MARK: - MLX Whisper STT Server (large, 8725)
-    func startMLXSTTServer() {
-        guard mlxSTTProcess == nil || !mlxSTTProcess!.isRunning else {
-            Log.info("[MLX-STT] already running"); return
-        }
-        run(ServerSpec(
-            name: "MLX-STT", port: 8725, logFile: "",
-            shouldRestart: { [weak self] in self?.sttMode == .localLarge },
-            launcher: {
-                let script = ConfigManager.configDir + "/start_stt.sh"
-                guard FileManager.default.fileExists(atPath: script) else {
-                    Log.error("[MLX-STT] start_stt.sh not found"); return nil
-                }
-                // Fail fast if model missing — saves watching "code=1" loops.
-                let modelPath = ConfigManager.configDir + "/models/ggml-large-v3-turbo-q5_0.bin"
-                guard FileManager.default.fileExists(atPath: modelPath) else {
-                    Log.error("[MLX-STT] ggml-large-v3-turbo-q5_0.bin not found — download it first")
-                    NotificationHelper.sendStatus("\u{274C} Large Whisper model not on disk"); return nil
-                }
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-                proc.arguments = [script]
-                return proc
-            },
-            getProcess: { [weak self] in self?.mlxSTTProcess },
-            setProcess: { [weak self] p in self?.mlxSTTProcess = p }
-        ))
-    }
-
-    func stopMLXSTTServer() {
-        mlxSTTProcess?.terminationHandler = nil
-        mlxSTTProcess?.terminate(); mlxSTTProcess = nil
-        Log.info("[MLX-STT] server stopped")
-    }
-
     // MARK: - Hotkeys
     private func setupHotkeys() {
         hotkeys.install()
@@ -319,7 +240,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startLiveDictation() {
         guard appState == .idle else { return }
-        if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         do {
             try recorder.start(); SoundCue.recordStart(); appState = .recording
             NotificationHelper.sendStatus("\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop")
@@ -345,7 +265,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startRecording() {
         guard appState == .idle else { return }
-        if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         do {
             try recorder.start(); SoundCue.recordStart(); appState = .recording
             NotificationHelper.sendStatus("\u{1F534} Recording... Press Fn to stop")
@@ -411,22 +330,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Always restarts the chunk at the given time offset — in-place seek
-    /// would require knowing which chunk the player is on, which we don't.
-    func jumpToWord(chunk: Int, time: TimeInterval) {
-        Log.info("[TTS] jumpToWord chunk=\(chunk) t=\(String(format: "%.2f", time))")
-        beginSpeaking()
-        ttsTask = Task { [weak self] in
-            guard let self else { return }
-            await SpeechService.resumeFromChunk(
-                startAt: chunk, api: api, player: player, voice: currentVoice,
-                model: currentTTSModel, rate: playbackRate, usage: usage,
-                startTime: time
-            )
-            await self.finishSpeech(refresh: false)
-        }
-    }
-
     func speakSelected() {
         Log.info("[TTS] speakSelected invoked (state=\(appState))")
         if appState == .speaking && player.paused {
@@ -482,7 +385,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Retry
     func retryPending(timestamp: String) {
-        if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         // Detached so stopAll() doesn't cancel it.
         Task.detached { [weak self] in
             guard let self else { return }
@@ -514,14 +416,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func quit() {
         Log.info("[QUIT] user requested quit")
         hotkeys.unregisterAll(); recorder.stop(); player.stop()
-        let children = [kokoroProcess, whisperProcess, mlxSTTProcess].compactMap { $0 }
-        for p in children { p.terminate() }
+        kokoroProcess?.terminate()
+        let child = kokoroProcess
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
-            for p in children where p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            if let p = child, p.isRunning { kill(p.processIdentifier, SIGKILL) }
             _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
                                  arguments: ["-9", "-f", "mlx_audio.server"])
-            _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
-                                 arguments: ["-9", "-f", "whisper-server"])
         }
         DispatchQueue.main.async {
             NSApplication.shared.terminate(nil)

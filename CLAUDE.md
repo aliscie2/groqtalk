@@ -32,13 +32,36 @@
 - Change the bundle ID (`com.groqtalk.app`) — TCC rows are keyed by it.
 - Switch back to ad-hoc signing in `build.sh`.
 
+## mlx-audio serialization patch — required for Parakeet stability
+
+**Symptom:** `mlx_audio.server` crashes with SIGSEGV / SIGABRT after ~3 Parakeet requests. Log line: `[KOKORO] server exited (code=11)` or `(code=6)`, with `resource_tracker: leaked semaphore` warning in the tail of `tts_server.log`.
+
+**Root cause:** MLX Metal is not thread-safe. Uvicorn's threadpool runs request handlers in parallel, two concurrent `model.generate()` calls corrupt the Metal command buffer, the process aborts. Upstream fix is [mlx-audio PR #594](https://github.com/Blaizzy/mlx-audio/pull/594) — still open as of April 2026.
+
+**The fix lives in this repo:** `scripts/patch-mlx-audio.sh`. It's idempotent; re-runs are no-ops. Users must run it once after `pip install mlx-audio` AND again after any `pip install -U mlx-audio`. If PR #594 ever merges, the script becomes harmless.
+
+**Do NOT:**
+- Run Parakeet STT without the patch (three requests then crash).
+- Assume that upgrading mlx-audio fixes this — PR is still open.
+- Swap in `parakeet-mlx` CLI per-request (model cold-load kills latency).
+
 ## Architecture quick reference
 
 - Swift macOS menu-bar app, built with `swiftc` + `build.sh` (no Xcode project).
 - Lives in `/Applications/GroqTalk.app` after install; config in `~/.config/groqtalk/`.
-- Spawns two local Python servers: `mlx_audio.server` on 8723 (TTS) and `whisper-server` on 8724 (STT).
-- Hotkeys implemented in `GroqTalk/Services/HotkeyService.swift` via `CGEvent.tapCreate` (modifier-only detection for Fn / Ctrl+Option) + Carbon `RegisterEventHotKey` for Cmd+Shift+Space.
-- Logs: `~/.config/groqtalk/groqtalk.log` (Swift side) and `~/.config/groqtalk/tts_server.log` (Python side).
+- **One** local Python server: `mlx_audio.server` on 8723 hosts both Kokoro TTS and Parakeet STT. Patched with the PR #594 serialization lock so TTS + STT inference can't race.
+- STT default: `mlx-community/parakeet-tdt-0.6b-v2`. TTS default: `mlx-community/Kokoro-82M-bf16`.
+- Hotkeys: `CGEvent.tapCreate` (modifier-only Fn / Ctrl+Option) + Carbon `RegisterEventHotKey` for Cmd+Shift+Space. See `GroqTalk/Services/HotkeyService.swift`.
+- Chunking: Apple `NLTagger` sentence segmentation + atomic-span mask (URLs via `NSDataDetector`, regex for versions/decimals/markdown-emphasis/inline-code, paired brackets/quotes). See `GroqTalk/Utilities/TextChunker.swift`.
+- Logs: `~/.config/groqtalk/groqtalk.log` (Swift) and `~/.config/groqtalk/tts_server.log` (Python, append-only so crash tracebacks survive respawn).
+
+## Intentional non-features (document pushback so future Claude doesn't re-add)
+
+- **No per-word click-to-seek.** Kokoro doesn't emit native timestamps; faking them via whisper post-alignment or character-weighted proportional mapping was rejected by the user as "a trick." Chunk-level click-to-jump remains (chunk boundaries ARE real audio splits).
+- **No karaoke per-word highlighting.** Same reason. Chunk-level active/done states are the hierarchy.
+- **No cloud** — Groq, OpenAI, ElevenLabs, Azure all removed / rejected. Local-only.
+- **No LLM text preprocessor** — user rejected the "AI polish display" idea in favor of deterministic NLTagger chunking.
+- **No Whisper.** Parakeet-TDT beats Whisper-large on English and runs faster. Whisper Small/Large paths were stripped along with the `start_stt.sh` launcher and `WordAligner`.
 
 ## Quit bug — fixed but worth knowing
 

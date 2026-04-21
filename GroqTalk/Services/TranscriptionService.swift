@@ -5,7 +5,7 @@ enum TranscriptionService {
 
     static func process(
         buffers: [AVAudioPCMBuffer], api: GroqAPIClient,
-        history: HistoryManager, usage: UsageTracker, sttMode: ConfigManager.STTMode = .localSmall
+        history: HistoryManager, usage: UsageTracker, sttMode: ConfigManager.STTMode = .parakeet
     ) async {
         let start = CFAbsoluteTimeGetCurrent()
         Log.info("[STT] final pipeline started, buffers=\(buffers.count)")
@@ -67,7 +67,7 @@ enum TranscriptionService {
     /// Retry transcription for a pending recording
     static func retryPending(
         timestamp: String, api: GroqAPIClient,
-        history: HistoryManager, usage: UsageTracker, sttMode: ConfigManager.STTMode = .localSmall
+        history: HistoryManager, usage: UsageTracker, sttMode: ConfigManager.STTMode = .parakeet
     ) async {
         guard let wavDataRaw = history.getPendingWav(timestamp: timestamp) else {
             NotificationHelper.sendStatus("\u{274C} Recording not found.")
@@ -109,7 +109,7 @@ enum TranscriptionService {
 
     // MARK: - Live transcription
 
-    static func liveLoop(recorder: AudioRecorder, api: GroqAPIClient, usage: UsageTracker, sttMode: ConfigManager.STTMode = .localSmall) async {
+    static func liveLoop(recorder: AudioRecorder, api: GroqAPIClient, usage: UsageTracker, sttMode: ConfigManager.STTMode = .parakeet) async {
         Log.info("[LIVE] live transcription started")
         var partsCollected = 0
         let interval: UInt64 = 3_000_000_000
@@ -140,21 +140,11 @@ enum TranscriptionService {
 
     private static func transcribe(mode: ConfigManager.STTMode, wavData: Data, api: GroqAPIClient) async throws -> String {
         let start = CFAbsoluteTimeGetCurrent()
-        let text: String
-        switch mode {
-        case .parakeet:
-            Log.info("[STT] sending to Parakeet (\(ConfigManager.sttMLXAudioURL))...")
-            text = try await api.transcribeMLXAudio(wavData: wavData)
-        case .localSmall:
-            Log.info("[STT] sending to local Whisper small (\(ConfigManager.sttBaseURL))...")
-            text = try await api.transcribeLocal(wavData: wavData, baseURL: ConfigManager.sttBaseURL)
-        case .localLarge:
-            Log.info("[STT] sending to local Whisper large (\(ConfigManager.sttLargeURL))...")
-            text = try await api.transcribeLocal(wavData: wavData, baseURL: ConfigManager.sttLargeURL)
-        }
+        Log.info("[STT] sending to Parakeet (\(ConfigManager.sttMLXAudioURL))...")
+        let text = try await api.transcribeMLXAudio(wavData: wavData)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
-        Log.info("[STT] \(mode) done in \(String(format: "%.2f", elapsed))s — \(trimmed.count) chars")
+        Log.info("[STT] parakeet done in \(String(format: "%.2f", elapsed))s — \(trimmed.count) chars")
         return trimmed
     }
 

@@ -15,55 +15,6 @@ final class GroqAPIClient: @unchecked Sendable {
         self.session = URLSession(configuration: config)
     }
 
-    // MARK: - Local Whisper (whisper.cpp on 8724/8725)
-
-    func transcribeLocal(
-        wavData: Data,
-        language: String = "en",
-        baseURL: String = ConfigManager.sttBaseURL
-    ) async throws -> String {
-        let boundary = UUID().uuidString
-        var request = URLRequest(url: URL(string: "\(baseURL)/inference")!)
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60
-
-        var body = Data()
-        func append(_ str: String) { body.append(str.data(using: .utf8)!) }
-
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
-        append("Content-Type: audio/wav\r\n\r\n")
-        body.append(wavData)
-        append("\r\n")
-
-        let prompt = ConfigManager.loadDictionary()
-        var fields = [("language", language), ("response_format", "text"), ("temperature", "0.0")]
-        if !prompt.isEmpty { fields.append(("prompt", prompt)) }
-        for (key, value) in fields {
-            append("--\(boundary)\r\n")
-            append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
-            append("\(value)\r\n")
-        }
-        append("--\(boundary)--\r\n")
-
-        request.httpBody = body
-        let (data, response) = try await session.data(for: request)
-
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            let body = String(data: data, encoding: .utf8) ?? "unknown error"
-            Log.error("[STT LOCAL] HTTP \(http.statusCode): \(body)")
-            throw NSError(domain: "GroqTalk", code: http.statusCode,
-                          userInfo: [NSLocalizedDescriptionKey: "Local Whisper error \(http.statusCode): \(body)"])
-        }
-
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let text = json["text"] as? String {
-            return text
-        }
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
     // MARK: - Parakeet STT via mlx_audio.server (port 8723, shared with Kokoro TTS)
 
     func transcribeMLXAudio(

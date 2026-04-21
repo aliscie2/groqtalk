@@ -10,8 +10,6 @@ enum SpeechService {
     static var lastSession: LastSession?
     static var chunkAudio: [Int: Data] = [:]
     private static var fetchTasks: [Int: Task<Data, Error>] = [:]
-    // WordAligner tasks per chunk; populated only when dialog is visible.
-    private static var alignTasks: [Int: Task<Void, Never>] = [:]
     private static let maxConcurrent = 3
 
     // MARK: - Public entry points
@@ -155,8 +153,6 @@ enum SpeechService {
     ) {
         chunkAudio.removeAll()
         fetchTasks.removeAll()
-        alignTasks.values.forEach { $0.cancel() }
-        alignTasks.removeAll()
         Log.info("[TTS] launching \(chunks.count) fetches (max \(maxConcurrent) concurrent)")
 
         var cursor = 0
@@ -170,12 +166,7 @@ enum SpeechService {
                         let data = try await api.speechData(text: chunk, voice: voice, model: model)
                         chunkAudio[i] = data
                         if showDialog {
-                            let duration = wavDuration(data)
-                            await MainActor.run {
-                                TTSDialog.shared.enableChunk(i)
-                                TTSDialog.shared.setChunkDuration(i, duration: duration)
-                            }
-                            launchAlignment(chunkIdx: i, wavData: data)
+                            await MainActor.run { TTSDialog.shared.enableChunk(i) }
                         }
                         Log.debug("[TTS] chunk \(i) fetched (\(data.count) bytes)")
                         launchNext()
@@ -193,22 +184,6 @@ enum SpeechService {
             }
         }
         for _ in 0..<min(maxConcurrent, chunks.count) { launchNext() }
-    }
-
-    private static func launchAlignment(chunkIdx: Int, wavData: Data) {
-        alignTasks[chunkIdx]?.cancel()
-        alignTasks[chunkIdx] = Task.detached(priority: .utility) {
-            do {
-                let words = try await WordAligner.align(wavData: wavData)
-                if Task.isCancelled { return }
-                Log.debug("[ALIGN] chunk \(chunkIdx) -> \(words.count) words")
-                await MainActor.run { TTSDialog.shared.setChunkWords(chunkIdx, words: words) }
-            } catch is CancellationError {
-                // normal
-            } catch {
-                Log.info("[ALIGN] chunk \(chunkIdx) failed: \(error.localizedDescription)")
-            }
-        }
     }
 
     // MARK: - Play from cache
@@ -237,50 +212,15 @@ enum SpeechService {
             NotificationHelper.sendStatus("\u{1F50A} Speaking \(i + 1)/\(chunks.count)...", subtitle: preview)
             if showDialog { TTSDialog.shared.setActiveChunk(i) }
 
-            // 15 Hz playhead poller for karaoke highlight; only while dialog visible.
-            let pollerTask: Task<Void, Never>? = showDialog ? Task { [i, player] in
-                while !Task.isCancelled {
-                    TTSDialog.shared.setChunkPlayhead(i, time: player.currentTime)
-                    try? await Task.sleep(for: .milliseconds(66))
-                }
-            } : nil
-
-            // startTime applies only to first chunk (mid-chunk seek from word click).
+            // startTime applies only to first chunk (mid-chunk seek from jumpToChunk).
             let offset: TimeInterval = (i == startAt) ? startTime : 0
             await player.play(data: wavData, rate: rate, startAt: offset)
-            pollerTask?.cancel()
             if player.cancelled { break }
         }
         return allWav
     }
 
-    // MARK: - WAV duration / errors
-
-    /// Parse WAV header for duration in seconds. Returns 0 on malformed input.
-    private static func wavDuration(_ data: Data) -> TimeInterval {
-        guard data.count >= 44,
-              data[0] == 0x52, data[1] == 0x49, data[2] == 0x46, data[3] == 0x46,
-              data[8] == 0x57, data[9] == 0x41, data[10] == 0x56, data[11] == 0x45
-        else { return 0 }
-
-        func u32LE(at off: Int) -> UInt32 {
-            UInt32(data[off]) | (UInt32(data[off+1]) << 8)
-                | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
-        }
-        var byteRate: UInt32 = 0, dataSize: UInt32 = 0, off = 12
-        while off + 8 <= data.count {
-            let id0 = data[off], id1 = data[off+1], id2 = data[off+2], id3 = data[off+3]
-            let size = u32LE(at: off + 4)
-            if id0 == 0x66, id1 == 0x6D, id2 == 0x74, id3 == 0x20, off + 24 <= data.count {
-                byteRate = u32LE(at: off + 16)
-            } else if id0 == 0x64, id1 == 0x61, id2 == 0x74, id3 == 0x61 {
-                dataSize = size; break
-            }
-            off += 8 + Int(size)
-        }
-        guard byteRate > 0, dataSize > 0 else { return 0 }
-        return TimeInterval(dataSize) / TimeInterval(byteRate)
-    }
+    // MARK: - Errors
 
     private static func humanError(_ err: Error) -> String {
         let ns = err as NSError
