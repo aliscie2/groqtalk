@@ -18,7 +18,7 @@ enum TranscriptionService {
 
             NotificationHelper.sendStatus("\u{231B} Processing audio...")
 
-            let (wavData, duration) = AudioProcessor.prepareForWhisper(buffers)
+            let (wavDataRaw, duration) = AudioProcessor.prepareForWhisper(buffers)
 
             guard duration >= 0.5 else {
                 NotificationHelper.sendStatus("\u{274C} Recording too short.")
@@ -36,6 +36,16 @@ enum TranscriptionService {
             let replayWav = AudioProcessor.encodeWAV(trimmedAudio)
             let pendingTs = history.savePendingRecording(wavBytes: replayWav)
 
+            // Optional pre-processing: isolate voice via mlx_audio.server to
+            // reduce background noise before STT. Fails safely to wavDataRaw.
+            let wavData: Data
+            if ConfigManager.denoiseBeforeSTT {
+                NotificationHelper.sendStatus("\u{231B} Denoising audio...")
+                wavData = await AudioSeparator.separate(wavData: wavDataRaw)
+            } else {
+                wavData = wavDataRaw
+            }
+
             // Now try transcription
             NotificationHelper.sendStatus("\u{231B} Transcribing...")
 
@@ -43,6 +53,8 @@ enum TranscriptionService {
             switch sttMode {
             case .groqCloud:
                 rawText = try await transcribeWhisper(wavData: wavData, duration: duration, api: api, usage: usage)
+            case .parakeet:
+                rawText = try await transcribeParakeet(wavData: wavData, api: api)
             case .localSmall:
                 rawText = try await transcribeLocal(wavData: wavData, duration: duration, api: api, baseURL: ConfigManager.sttBaseURL)
             case .localLarge:
@@ -81,20 +93,31 @@ enum TranscriptionService {
         timestamp: String, api: GroqAPIClient, enhance: Bool,
         history: HistoryManager, usage: UsageTracker, sttMode: ConfigManager.STTMode = .groqCloud
     ) async {
-        guard let wavData = history.getPendingWav(timestamp: timestamp) else {
+        guard let wavDataRaw = history.getPendingWav(timestamp: timestamp) else {
             NotificationHelper.sendStatus("\u{274C} Recording not found.")
             return
         }
 
-        let duration = Double(wavData.count - 44) / Double(ConfigManager.sampleRate * 2)
+        let duration = Double(wavDataRaw.count - 44) / Double(ConfigManager.sampleRate * 2)
 
         do {
             NotificationHelper.sendStatus("\u{231B} Retrying transcription...")
+
+            // Same opt-in denoise step as the main pipeline.
+            let wavData: Data
+            if ConfigManager.denoiseBeforeSTT {
+                NotificationHelper.sendStatus("\u{231B} Denoising audio...")
+                wavData = await AudioSeparator.separate(wavData: wavDataRaw)
+            } else {
+                wavData = wavDataRaw
+            }
 
             let rawText: String
             switch sttMode {
             case .groqCloud:
                 rawText = try await transcribeWhisper(wavData: wavData, duration: duration, api: api, usage: usage)
+            case .parakeet:
+                rawText = try await transcribeParakeet(wavData: wavData, api: api)
             case .localSmall:
                 rawText = try await transcribeLocal(wavData: wavData, duration: duration, api: api, baseURL: ConfigManager.sttBaseURL)
             case .localLarge:
@@ -141,6 +164,19 @@ enum TranscriptionService {
         let text = try await api.transcribeLocal(wavData: wavData, baseURL: baseURL)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
         Log.info("[STT] Local Whisper done in \(String(format: "%.2f", elapsed))s — \(text.count) chars")
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Parakeet (mlx_audio.server)
+
+    private static func transcribeParakeet(
+        wavData: Data, api: GroqAPIClient
+    ) async throws -> String {
+        let start = CFAbsoluteTimeGetCurrent()
+        Log.info("[STT] sending to Parakeet (\(ConfigManager.sttMLXAudioURL))...")
+        let text = try await api.transcribeMLXAudio(wavData: wavData)
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        Log.info("[STT] Parakeet done in \(String(format: "%.2f", elapsed))s — \(text.count) chars")
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -218,6 +254,8 @@ enum TranscriptionService {
                 switch sttMode {
                 case .groqCloud:
                     text = try await api.transcribe(wavData: wavData)
+                case .parakeet:
+                    text = try await api.transcribeMLXAudio(wavData: wavData)
                 case .localSmall:
                     text = try await api.transcribeLocal(wavData: wavData, baseURL: ConfigManager.sttBaseURL)
                 case .localLarge:

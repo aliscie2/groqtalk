@@ -8,6 +8,9 @@ final class AudioPlayer: @unchecked Sendable {
     private(set) var cancelled = false
     private(set) var paused = false
 
+    /// Current playback position of the active chunk (seconds). 0 when idle.
+    var currentTime: TimeInterval { audioPlayer?.currentTime ?? 0 }
+
     func play(data: Data, rate: Float = 1.0) async {
         lock.lock()
         if cancelled { lock.unlock(); return }

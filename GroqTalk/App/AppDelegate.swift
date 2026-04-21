@@ -64,10 +64,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             warmConnection()
         }
 
+        // Register hot-swap handlers before spawning servers so the lifecycle
+        // module owns start/stop from the first tick.
+        ModelLifecycle.kokoroStart  = { [weak self] in self?.startKokoroServer() }
+        ModelLifecycle.kokoroStop   = { [weak self] in self?.stopKokoroServer() }
+        ModelLifecycle.whisperStart = { [weak self] in self?.startWhisperServer() }
+        ModelLifecycle.whisperStop  = { [weak self] in self?.stopWhisperServer() }
+
         startKokoroServer()
-        if sttMode == .localSmall { startWhisperServer() }
-        else if sttMode == .localLarge { startMLXSTTServer() }
-        Log.info("GroqTalk started — Fn (Record) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue)")
+        ModelLifecycle.markKokoroStarted()
+        if sttMode == .localSmall {
+            startWhisperServer()
+            ModelLifecycle.markWhisperStarted()
+        } else if sttMode == .localLarge {
+            startMLXSTTServer()
+        }
+        Log.info("GroqTalk started — Fn (Record) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue) | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
     }
 
     // MARK: - Kokoro TTS Server
@@ -117,6 +129,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startKokoroServer()
     }
 
+    /// Terminate mlx_audio.server to free RAM while idle (used by ModelLifecycle).
+    func stopKokoroServer() {
+        kokoroProcess?.terminate()
+        kokoroProcess = nil
+        // Belt-and-braces: kill any orphan too, since mlx_audio sometimes forks.
+        killExistingKokoroServer()
+        Log.info("[KOKORO] server stopped (idle unload)")
+    }
+
     // MARK: - Local Whisper STT Server
 
     func startWhisperServer() {
@@ -149,7 +170,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "--language", "en",
             "--no-timestamps",
             "--flash-attn",
-            "-bs", "1"
+            "-bs", "1",
+            // Word-level alignment support for karaoke highlighting in TTS dialog.
+            // --dtw loads alignment heads for the matching model preset;
+            // --max-len 1 + --split-on-word + --word-thold 0.01 make each
+            // verbose_json segment correspond to a single word.
+            "--dtw", dtwPreset(forModelPath: modelPath),
+            "--max-len", "1",
+            "--split-on-word",
+            "--word-thold", "0.01"
         ]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
@@ -161,6 +190,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             Log.error("[WHISPER] failed to start: \(error)")
         }
+    }
+
+    /// Map a GGML model filename to the whisper.cpp `--dtw` preset name
+    /// (e.g. "small.en", "large.v3"). Falls back to "small.en" on unknown paths.
+    private func dtwPreset(forModelPath path: String) -> String {
+        let name = (path as NSString).lastPathComponent.lowercased()
+        if name.contains("large-v3") { return "large.v3" }
+        if name.contains("large-v2") { return "large.v2" }
+        if name.contains("large-v1") { return "large.v1" }
+        if name.contains("large")    { return "large.v3" }
+        if name.contains("medium.en") || name.contains("medium-en") { return "medium.en" }
+        if name.contains("medium")   { return "medium" }
+        if name.contains("small.en") || name.contains("small-en") { return "small.en" }
+        if name.contains("small")    { return "small" }
+        if name.contains("base.en")  || name.contains("base-en")  { return "base.en" }
+        if name.contains("base")     { return "base" }
+        if name.contains("tiny.en")  || name.contains("tiny-en")  { return "tiny.en" }
+        if name.contains("tiny")     { return "tiny" }
+        return "small.en"
     }
 
     func stopWhisperServer() {
@@ -223,6 +271,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             fnAction: { [weak self] in self?.toggleRecording() },
             ctrlOptAction: { [weak self] in self?.speakSelected() }
         )
+        hotkeys.installLiveDictationHotkey { [weak self] in self?.toggleLiveDictation() }
+    }
+
+    // MARK: - Live Dictation
+
+    /// Toggle live dictation: starts recording + streaming whisper transcription
+    /// that types into the focused app. Press again to stop.
+    func toggleLiveDictation() {
+        if appState == .recording {
+            stopLiveDictation()
+        } else if appState == .idle {
+            startLiveDictation()
+        }
+    }
+
+    private func startLiveDictation() {
+        guard appState == .idle else { return }
+        // Pre-warm whisper while user is still speaking — reload happens in parallel.
+        if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
+        do {
+            try recorder.start()
+            SoundCue.recordStart()
+            appState = .recording
+            NotificationHelper.sendStatus("\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop")
+            startLiveTranscription()
+        } catch {
+            Log.error("[LIVE] failed to start: \(error)")
+            appState = .idle
+        }
+    }
+
+    private func stopLiveDictation() {
+        guard appState == .recording else { return }
+        liveTask?.cancel()
+        SoundCue.recordStop()
+        _ = recorder.stop()
+        appState = .idle
+        statusBar.setStopVisible(false)
+        NotificationHelper.clearStatus()
+        Log.info("[LIVE] dictation stopped")
     }
 
     // MARK: - Warmup
@@ -248,6 +336,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startRecording() {
         guard appState == .idle else { return }
+        // Pre-warm whisper while user is still speaking — reload happens in parallel.
+        if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         do {
             try recorder.start()
             SoundCue.recordStart()
@@ -296,6 +386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func jumpToChunk(_ index: Int) {
         Log.info("[TTS] jumpToChunk \(index)")
+        if ttsEngine == .fast { ModelLifecycle.touchKokoro() }
         ttsTask?.cancel()
         player.stop()
         appState = .speaking
@@ -335,6 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Not speaking → start fresh
+        if ttsEngine == .fast { ModelLifecycle.touchKokoro() }
         ttsTask?.cancel()
         player.stop()
         guard appState == .idle else { return }
@@ -384,6 +476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func reuseText(_ text: String) {
+        if ttsEngine == .fast { ModelLifecycle.touchKokoro() }
         ttsTask?.cancel()
         player.stop()
         appState = .speaking
@@ -409,6 +502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Retry pending recording
 
     func retryPending(timestamp: String) {
+        if sttMode == .localSmall { ModelLifecycle.touchWhisper() }
         // Use detached task so stopAll() doesn't cancel it
         Task.detached { [weak self] in
             guard let self else { return }

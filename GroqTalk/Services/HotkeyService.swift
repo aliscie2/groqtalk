@@ -4,6 +4,9 @@ import Foundation
 
 final class HotkeyService {
 
+    // Hotkey IDs
+    static let hotkeyIDLiveDictation: UInt32 = 1
+
     private var hotkeyRefs: [EventHotKeyRef] = []
     fileprivate static var callbacks: [UInt32: () -> Void] = [:]
     private var handlerRef: EventHandlerRef?
@@ -86,6 +89,15 @@ final class HotkeyService {
         var ref: EventHotKeyRef?
         RegisterEventHotKey(keyCode, modifiers, hotkeyID, GetApplicationEventTarget(), 0, &ref)
         if let ref { hotkeyRefs.append(ref) }
+    }
+
+    /// Register Cmd+Shift+Space for live dictation toggle.
+    func installLiveDictationHotkey(action: @escaping () -> Void) {
+        // kVK_Space = 0x31, cmdKey | shiftKey
+        let keyCode: UInt32 = 0x31
+        let modifiers: UInt32 = UInt32(cmdKey) | UInt32(shiftKey)
+        register(keyCode: keyCode, modifiers: modifiers, id: HotkeyService.hotkeyIDLiveDictation, callback: action)
+        Log.info("[HOTKEY] Live dictation registered (Cmd+Shift+Space)")
     }
 
     func disableTap() {

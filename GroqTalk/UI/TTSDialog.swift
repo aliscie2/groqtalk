@@ -41,6 +41,30 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
         }
     }
 
+    /// Supply word-level timestamps (from whisper.cpp `verbose_json`) for a
+    /// specific TTS chunk. The dialog will karaoke-highlight words matching
+    /// the current playhead once `setChunkPlayhead` is being called for that
+    /// chunk.
+    func setChunkWords(_ index: Int, words: [WordAligner.Word]) {
+        let payload = words.map { ["t": $0.text, "s": $0.start, "e": $0.end] as [String: Any] }
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let jsonString = String(data: jsonData, encoding: .utf8) else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.webView?.evaluateJavaScript(
+                "setChunkWords(\(index), \(jsonString))", completionHandler: nil)
+        }
+    }
+
+    /// Tell the dialog the current playback position (seconds) for the
+    /// active chunk. Call this at ~15 Hz from Swift while the chunk plays;
+    /// the page will flip the `.word-active` class to the matching word.
+    func setChunkPlayhead(_ index: Int, time: TimeInterval) {
+        DispatchQueue.main.async { [weak self] in
+            self?.webView?.evaluateJavaScript(
+                "setChunkPlayhead(\(index), \(time))", completionHandler: nil)
+        }
+    }
+
     func finish() {
         Log.info("[DIALOG] finish")
         DispatchQueue.main.async { [weak self] in
@@ -398,6 +422,9 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
         text-align: center;
         padding: 20px;
       }
+
+      /* Karaoke word highlight */
+      .word-active { background: rgba(196,181,253,0.35); color: #fff; padding: 1px 3px; border-radius: 3px; transition: background 0.08s; }
     </style>
     </head>
     <body>
@@ -512,6 +539,10 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     let activeIdx = -1;
     let enabledSet = new Set();
+    // Per-chunk word timing data: chunkWords[chunkIdx] = [{t,s,e}, ...]
+    const chunkWords = {};
+    // Currently-highlighted word span per chunk (for fast swap on playhead tick)
+    const activeWordSpan = {};
 
     function chunkType(c) {
       var t = c.trim();
@@ -570,6 +601,83 @@ final class TTSDialog: NSObject, WKScriptMessageHandler {
 
     function showError(msg) {
       document.getElementById('content').innerHTML = '<div class="error">\\u26A0\\uFE0F  ' + msg + '</div>';
+    }
+
+    // Walk text nodes inside a chunk element and wrap each whitespace-separated
+    // word token in a <span class="w" data-wi="N">. Structural children
+    // (<code>, <strong>, etc.) are recursed into so formatted words still
+    // receive indices in left-to-right reading order.
+    function wrapChunkWords(chunkEl) {
+      if (!chunkEl || chunkEl.dataset.wrapped === '1') return 0;
+      let counter = 0;
+      const walk = (node) => {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const text = node.nodeValue;
+          if (!text || !text.trim()) return;
+          const parts = text.split(/(\\s+)/); // keep whitespace
+          const frag = document.createDocumentFragment();
+          for (const p of parts) {
+            if (!p) continue;
+            if (/^\\s+$/.test(p)) {
+              frag.appendChild(document.createTextNode(p));
+            } else {
+              const span = document.createElement('span');
+              span.className = 'w';
+              span.dataset.wi = String(counter++);
+              span.textContent = p;
+              frag.appendChild(span);
+            }
+          }
+          node.parentNode.replaceChild(frag, node);
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+          // Skip elements that would be visually weird to wrap
+          const tag = node.tagName;
+          if (tag === 'PRE' || tag === 'TABLE') return;
+          const kids = Array.from(node.childNodes);
+          for (const k of kids) walk(k);
+        }
+      };
+      const kids = Array.from(chunkEl.childNodes);
+      for (const k of kids) walk(k);
+      chunkEl.dataset.wrapped = '1';
+      chunkEl.dataset.wcount = String(counter);
+      return counter;
+    }
+
+    function setChunkWords(i, words) {
+      chunkWords[i] = words || [];
+      const el = document.querySelector('[data-i="' + i + '"]');
+      if (!el) return;
+      wrapChunkWords(el);
+    }
+
+    function setChunkPlayhead(i, t) {
+      const words = chunkWords[i];
+      if (!words || !words.length) return;
+      const el = document.querySelector('[data-i="' + i + '"]');
+      if (!el) return;
+      // Find the word whose [start,end) contains t (linear scan — tiny N).
+      let idx = -1;
+      for (let k = 0; k < words.length; k++) {
+        if (t >= words[k].s && t < words[k].e) { idx = k; break; }
+      }
+      if (idx < 0) {
+        // Past the last word end? Keep last span lit briefly; otherwise clear.
+        const last = words[words.length - 1];
+        if (last && t >= last.e) idx = -1;
+      }
+      const prev = activeWordSpan[i];
+      if (prev && prev.dataset.wi === String(idx)) return; // no change
+      if (prev) prev.classList.remove('word-active');
+      if (idx >= 0) {
+        const span = el.querySelector('.w[data-wi="' + idx + '"]');
+        if (span) {
+          span.classList.add('word-active');
+          activeWordSpan[i] = span;
+          return;
+        }
+      }
+      activeWordSpan[i] = null;
     }
 
     function tryJump(i) {

@@ -137,14 +137,64 @@ final class GroqAPIClient: @unchecked Sendable {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    func speechData(text: String, voice: String = ConfigManager.ttsVoice) async throws -> Data {
+    func transcribeMLXAudio(wavData: Data, language: String = "en", model: String = ConfigManager.parakeetModel) async throws -> String {
+        let boundary = UUID().uuidString
+        var request = URLRequest(url: URL(string: "\(ConfigManager.sttMLXAudioURL)/v1/audio/transcriptions")!)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+
+        var body = Data()
+        func append(_ str: String) { body.append(str.data(using: .utf8)!) }
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
+        append("Content-Type: audio/wav\r\n\r\n")
+        body.append(wavData)
+        append("\r\n")
+
+        let fields = [("model", model), ("language", language)]
+        for (key, value) in fields {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
+            append("\(value)\r\n")
+        }
+        append("--\(boundary)--\r\n")
+
+        request.httpBody = body
+        let (data, response) = try await session.data(for: request)
+
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            let body = String(data: data, encoding: .utf8) ?? "unknown error"
+            Log.error("[STT PARAKEET] HTTP \(http.statusCode): \(body)")
+            throw NSError(domain: "GroqTalk", code: http.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "Parakeet error \(http.statusCode): \(body)"])
+        }
+
+        // mlx_audio.server streams JSON lines; join and pull final "accumulated" or "text"
+        let raw = String(data: data, encoding: .utf8) ?? ""
+        var finalText = ""
+        for line in raw.split(separator: "\n") {
+            guard let lineData = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+            if let acc = obj["accumulated"] as? String { finalText = acc }
+            else if let t = obj["text"] as? String { finalText += t }
+        }
+        if finalText.isEmpty, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let t = obj["text"] as? String {
+            finalText = t
+        }
+        return finalText
+    }
+
+    func speechData(text: String, voice: String, model: String) async throws -> Data {
         var request = URLRequest(url: URL(string: "\(ConfigManager.ttsBaseURL)/v1/audio/speech")!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60
+        request.timeoutInterval = 120
 
         let payload: [String: Any] = [
-            "model": ConfigManager.ttsModel,
+            "model": model,
             "input": text,
             "voice": voice,
             "response_format": "wav"

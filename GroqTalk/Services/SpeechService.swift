@@ -10,6 +10,10 @@ enum SpeechService {
     static var lastSession: LastSession?
     static var chunkAudio: [Int: Data] = [:]
     private static var fetchTasks: [Int: Task<Data, Error>] = [:]
+    // Word-level timings indexed by chunk; populated asynchronously by
+    // WordAligner after each chunk's WAV is fetched. Only used when the
+    // TTS dialog is visible and karaoke highlighting is active.
+    private static var alignTasks: [Int: Task<Void, Never>] = [:]
 
     static func speak(
         api: GroqAPIClient, player: AudioPlayer, voice: String, model: String,
@@ -168,6 +172,8 @@ enum SpeechService {
     ) {
         chunkAudio.removeAll()
         fetchTasks.removeAll()
+        alignTasks.values.forEach { $0.cancel() }
+        alignTasks.removeAll()
         Log.info("[TTS] launching \(chunks.count) fetches (max \(maxConcurrent) concurrent)")
 
         let pending = chunks.enumerated().map { ($0.offset, $0.element) }
@@ -185,6 +191,7 @@ enum SpeechService {
                         chunkAudio[i] = data
                         if showDialog {
                             await MainActor.run { TTSDialog.shared.enableChunk(i) }
+                            launchAlignment(chunkIdx: i, wavData: data)
                         }
                         Log.debug("[TTS] chunk \(i) fetched (\(data.count) bytes)")
                         launchNext()
@@ -204,6 +211,27 @@ enum SpeechService {
 
         for _ in 0..<min(maxConcurrent, chunks.count) {
             launchNext()
+        }
+    }
+
+    /// Fire off a background WordAligner request for a freshly-fetched chunk.
+    /// Alignment runs concurrently with audio playback and silently drops out
+    /// on failure (dialog simply falls back to chunk-level highlight).
+    private static func launchAlignment(chunkIdx: Int, wavData: Data) {
+        alignTasks[chunkIdx]?.cancel()
+        alignTasks[chunkIdx] = Task.detached(priority: .utility) {
+            do {
+                let words = try await WordAligner.align(wavData: wavData)
+                if Task.isCancelled { return }
+                Log.debug("[ALIGN] chunk \(chunkIdx) -> \(words.count) words")
+                await MainActor.run {
+                    TTSDialog.shared.setChunkWords(chunkIdx, words: words)
+                }
+            } catch is CancellationError {
+                // normal
+            } catch {
+                Log.info("[ALIGN] chunk \(chunkIdx) failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -241,7 +269,20 @@ enum SpeechService {
                 "\u{1F50A} Speaking \(i + 1)/\(chunks.count)...", subtitle: preview
             )
             if showDialog { TTSDialog.shared.setActiveChunk(i) }
+
+            // Start a 15 Hz playhead poller so the dialog can karaoke-highlight
+            // words as AVAudioPlayer advances through this chunk. Only runs
+            // while the TTS dialog is visible; otherwise it's a no-op loop.
+            let pollerTask: Task<Void, Never>? = showDialog ? Task { [i, player] in
+                while !Task.isCancelled {
+                    let t = player.currentTime
+                    TTSDialog.shared.setChunkPlayhead(i, time: t)
+                    try? await Task.sleep(for: .milliseconds(66)) // ~15 Hz
+                }
+            } : nil
+
             await player.play(data: wavData, rate: rate)
+            pollerTask?.cancel()
             if player.cancelled { break }
         }
 

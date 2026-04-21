@@ -8,6 +8,7 @@ final class StatusBarController: NSObject {
 
     private var stopItem: NSMenuItem!
     private var enhanceItem: NSMenuItem!
+    private var denoiseItem: NSMenuItem!
     private var dialogItem: NSMenuItem!
     private var sttSubmenu: NSMenu!
     private var ttsSubmenu: NSMenu!
@@ -39,6 +40,10 @@ final class StatusBarController: NSObject {
         speakItem.target = self
         menu.addItem(speakItem)
 
+        let liveDictationItem = NSMenuItem(title: "Live Dictation (Cmd+Shift+Space)", action: #selector(handleLiveDictation), keyEquivalent: "")
+        liveDictationItem.target = self
+        menu.addItem(liveDictationItem)
+
         stopItem = NSMenuItem(title: "\u{23F9} Stop", action: #selector(handleStop), keyEquivalent: "")
         stopItem.target = self
         stopItem.isHidden = true
@@ -66,6 +71,11 @@ final class StatusBarController: NSObject {
         enhanceItem.target = self
         enhanceItem.state = .off
         menu.addItem(enhanceItem)
+
+        denoiseItem = NSMenuItem(title: "Denoise Recording (experimental)", action: #selector(handleToggleDenoise), keyEquivalent: "")
+        denoiseItem.target = self
+        denoiseItem.state = ConfigManager.denoiseBeforeSTT ? .on : .off
+        menu.addItem(denoiseItem)
 
         let sttItem = NSMenuItem(title: "STT Engine", action: nil, keyEquivalent: "")
         sttSubmenu = NSMenu()
@@ -319,12 +329,19 @@ final class StatusBarController: NSObject {
 
     @objc private func handleRecord(_ sender: NSMenuItem) { appDelegate?.toggleRecording() }
     @objc private func handleSpeak(_ sender: NSMenuItem) { appDelegate?.speakSelected() }
+    @objc private func handleLiveDictation(_ sender: NSMenuItem) { appDelegate?.toggleLiveDictation() }
     @objc private func handleStop(_ sender: NSMenuItem) { appDelegate?.stopAll() }
 
     @objc private func handleToggleEnhance(_ sender: NSMenuItem) {
         guard let d = appDelegate else { return }
         d.enhanceText.toggle()
         enhanceItem.state = d.enhanceText ? .on : .off
+    }
+
+    @objc private func handleToggleDenoise(_ sender: NSMenuItem) {
+        ConfigManager.denoiseBeforeSTT.toggle()
+        denoiseItem.state = ConfigManager.denoiseBeforeSTT ? .on : .off
+        Log.info("[DENOISE] toggled: \(ConfigManager.denoiseBeforeSTT ? "ON" : "OFF")")
     }
 
     @objc private func handleToggleDialog(_ sender: NSMenuItem) {

@@ -68,6 +68,26 @@ struct ConfigManager {
         set { UserDefaults.standard.set(newValue, forKey: showTTSDialogKey) }
     }
 
+    private static let denoiseBeforeSTTKey = "denoiseBeforeSTT"
+    /// When on, the recorded WAV is routed through mlx_audio.server's
+    /// /v1/audio/separations endpoint to isolate voice before STT. Opt-in
+    /// (default false) because the endpoint is experimental and adds latency.
+    static var denoiseBeforeSTT: Bool {
+        get { UserDefaults.standard.bool(forKey: denoiseBeforeSTTKey) }
+        set { UserDefaults.standard.set(newValue, forKey: denoiseBeforeSTTKey) }
+    }
+
+    /// Seconds of inactivity before whisper/kokoro servers are unloaded to free RAM.
+    /// 0 disables hot-swap (servers stay resident). Default 0 — user opts in.
+    private static let idleUnloadSecondsKey = "idleUnloadSeconds"
+    static var idleUnloadSeconds: Int {
+        get {
+            if UserDefaults.standard.object(forKey: idleUnloadSecondsKey) == nil { return 0 }
+            return UserDefaults.standard.integer(forKey: idleUnloadSecondsKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: idleUnloadSecondsKey) }
+    }
+
     static func loadDictionary() -> String {
         guard let content = try? String(contentsOfFile: dictionaryPath, encoding: .utf8) else { return "" }
         return content.trimmingCharacters(in: .whitespacesAndNewlines)
