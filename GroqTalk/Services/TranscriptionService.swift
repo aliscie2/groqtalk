@@ -140,11 +140,12 @@ enum TranscriptionService {
 
     private static func transcribe(mode: ConfigManager.STTMode, wavData: Data, api: GroqAPIClient) async throws -> String {
         let start = CFAbsoluteTimeGetCurrent()
-        Log.info("[STT] sending to Parakeet (\(ConfigManager.sttMLXAudioURL))...")
-        let text = try await api.transcribeMLXAudio(wavData: wavData)
+        let model = ConfigManager.sttModelID[mode] ?? ConfigManager.parakeetModel
+        Log.info("[STT] sending to \(mode.rawValue) (\(ConfigManager.sttMLXAudioURL))...")
+        let text = try await api.transcribeMLXAudio(wavData: wavData, model: model)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
-        Log.info("[STT] parakeet done in \(String(format: "%.2f", elapsed))s — \(trimmed.count) chars")
+        Log.info("[STT] \(mode.rawValue) done in \(String(format: "%.2f", elapsed))s — \(trimmed.count) chars")
         return trimmed
     }
 

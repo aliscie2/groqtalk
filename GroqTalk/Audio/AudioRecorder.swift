@@ -8,6 +8,11 @@ final class AudioRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var isRecording = false
 
+    /// Fired on the audio tap thread with the current buffer's RMS level
+    /// (roughly [0, 1]). Consumers should hop to main if they touch UI.
+    /// Set on the main thread; do not reassign while recording is active.
+    var onLevel: ((Float) -> Void)?
+
     func start() throws {
         // Remove any leftover tap to avoid "tap already installed" crash
         if engine.isRunning {
@@ -53,6 +58,19 @@ final class AudioRecorder: @unchecked Sendable {
             lock.lock()
             buffers.append(outputBuffer)
             lock.unlock()
+
+            // Fire RMS level for the recording indicator. Computed from the
+            // converted mono buffer so the number matches what's stored.
+            if let cb = self.onLevel,
+               let ch = outputBuffer.floatChannelData?[0] {
+                let n = Int(outputBuffer.frameLength)
+                if n > 0 {
+                    var sum: Float = 0
+                    for i in 0..<n { sum += ch[i] * ch[i] }
+                    let rms = (sum / Float(n)).squareRoot()
+                    cb(rms)
+                }
+            }
         }
 
         try engine.start()

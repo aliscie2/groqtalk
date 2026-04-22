@@ -12,14 +12,21 @@ struct ConfigManager {
     static let sttMLXAudioURL   = "http://127.0.0.1:8723"
     static let ttsBaseURL       = "http://127.0.0.1:8723"
 
-    static let parakeetModel = "mlx-community/parakeet-tdt-0.6b-v2"
+    static let sttModelID: [STTMode: String] = [
+        .parakeet: "mlx-community/parakeet-tdt-0.6b-v2",
+    ]
+    static let parakeetModel = sttModelID[.parakeet]!
 
-    // English-only local STT. Parakeet-TDT beats Whisper-large on the HF
-    // OpenASR English leaderboard AND runs ~60–120× real-time on M-series,
-    // so there's no reason to keep the Whisper fallbacks around.
+    /// Parakeet-TDT-0.6B-v2 — ~0.06s/3s-clip English ASR via mlx-audio.server.
+    /// Known weakness: no integrated LM → occasional errors on minimal pairs
+    /// ("can"/"can't", "bed"/"bet"). Voxtral-Mini-3B was evaluated as a
+    /// more-accurate alternative but mlx-audio's voxtral handler hangs
+    /// indefinitely on that checkpoint in this environment. Revisit when
+    /// an MLX port of Canary-Qwen-2.5B appears, or when mlx-audio supports
+    /// Voxtral-Realtime variants cleanly.
     enum STTMode: String { case parakeet }
     static let sttModels: [(mode: STTMode, label: String, path: String)] = [
-        (.parakeet, "Parakeet TDT", ""),
+        (.parakeet, "Parakeet", ""),
     ]
 
     static let systemRAM: UInt64 = ProcessInfo.processInfo.physicalMemory

@@ -34,6 +34,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // monitor surfaces a lock icon so the cause is visible in under a sec.
         SecureInputMonitor.shared.start { [weak self] in self?.statusBar.setSecureInputWarning($0) }
         SoundCue.prepare()
+        // Feed mic RMS to the recording indicator so the VU-meter bars react.
+        recorder.onLevel = { level in RecordingIndicator.shared.setLevel(level) }
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
         TTSDialog.shared.onPauseToggle = { [weak self] in
             guard let self else { return }
@@ -417,6 +419,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// SIGTERM then SIGKILL after 300ms — mlx_audio.server sometimes wedges
     /// mid-model-load and won't honor SIGTERM. Hard-exit 1s later because
     /// terminate(nil) can stall on any lingering window.
+    /// Pre-warm a specific STT mode by firing a silent 0.5s WAV at it. The
+    /// first inference call on a cold model is slow (Voxtral-3B takes ~10-30s
+    /// to load 8.7 GB of weights into MLX); this absorbs that delay at
+    /// menu-select time instead of at the user's first Fn press.
+    /// Fire-and-forget; logs outcome. Ignores errors.
+    func warmSTT(mode: ConfigManager.STTMode) {
+        let wav = Self.silentWAV(seconds: 0.5, sampleRate: ConfigManager.sampleRate)
+        let model = ConfigManager.sttModelID[mode] ?? ConfigManager.parakeetModel
+        Log.info("[STT] warming \(mode.rawValue) — first request may take 10-30s if cold")
+        Task.detached(priority: .utility) { [api] in
+            let start = CFAbsoluteTimeGetCurrent()
+            do {
+                _ = try await api.transcribeMLXAudio(wavData: wav, model: model)
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                Log.info("[STT] \(mode.rawValue) warmed in \(String(format: "%.1f", elapsed))s")
+            } catch {
+                Log.info("[STT] \(mode.rawValue) warm failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Generate a minimal PCM16 mono WAV of the given length filled with silence.
+    /// Used for STT warmups — the model still does a full forward pass, so the
+    /// cold-load happens, but the input is short to keep the warmup fast.
+    private static func silentWAV(seconds: Double, sampleRate: Int) -> Data {
+        let frames = Int(seconds * Double(sampleRate))
+        let dataBytes = frames * 2            // PCM16 mono
+        let byteRate  = sampleRate * 2
+        var header = Data(capacity: 44)
+        func u32(_ v: UInt32) {
+            header.append(UInt8(v & 0xFF))
+            header.append(UInt8((v >> 8) & 0xFF))
+            header.append(UInt8((v >> 16) & 0xFF))
+            header.append(UInt8((v >> 24) & 0xFF))
+        }
+        func u16(_ v: UInt16) {
+            header.append(UInt8(v & 0xFF))
+            header.append(UInt8((v >> 8) & 0xFF))
+        }
+        header.append(contentsOf: "RIFF".utf8); u32(UInt32(36 + dataBytes))
+        header.append(contentsOf: "WAVE".utf8)
+        header.append(contentsOf: "fmt ".utf8); u32(16); u16(1); u16(1)  // PCM, mono
+        u32(UInt32(sampleRate)); u32(UInt32(byteRate)); u16(2); u16(16)
+        header.append(contentsOf: "data".utf8); u32(UInt32(dataBytes))
+        return header + Data(count: dataBytes)
+    }
+
     func quit() {
         Log.info("[QUIT] user requested quit")
         hotkeys.unregisterAll(); recorder.stop(); player.stop()

@@ -233,7 +233,11 @@ final class StatusBarController: NSObject {
               let mode = ConfigManager.STTMode(rawValue: raw) else { return }
         d.sttMode = mode
         selectRadio(in: sttSubmenu) { ($0.representedObject as? String) == raw }
-        // Only one STT engine now (Parakeet); it rides on the Kokoro server.
+        // Kick off a silent warmup so the first real press doesn't wait on
+        // the cold model load. Critical for Voxtral (8.7 GB) which takes
+        // 10-30s to load; without this the user presses Fn, records a short
+        // clip, and cancels before the server finishes loading.
+        d.warmSTT(mode: mode)
     }
 
     @objc private func handleSetVoice(_ sender: NSMenuItem) {
