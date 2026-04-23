@@ -232,7 +232,6 @@ enum TextChunker {
             .trimmingCharacters(in: .whitespaces)
 
         let sentences = sentenceSegment(flat)
-        let atoms = atomicSpans(flat)
 
         var chunks: [String] = []
         var buf = ""
@@ -248,7 +247,7 @@ enum TextChunker {
                 buf = sentence
             }
             if buf.count > maxChunk {
-                chunks.append(contentsOf: softSplit(buf, atoms: atoms))
+                chunks.append(contentsOf: softSplit(buf))
                 buf = ""
             }
         }
@@ -354,14 +353,17 @@ enum TextChunker {
     /// Split a single over-long sentence at clause boundaries. Preference
     /// order: `;`/`:` → `",`/`")`/`"]` → ` — `/` -- ` → ` and/but/because…` →
     /// last space before 230. Never splits inside an atomic span.
-    private static func softSplit(_ sentence: String, atoms: [NSRange]) -> [String] {
+    private static func softSplit(_ sentence: String) -> [String] {
         if sentence.count <= maxChunk { return [sentence] }
         var out: [String] = []
         var remaining = sentence
 
         while remaining.count > maxChunk {
-            let window = String(remaining.prefix(maxChunk))
-            let ns = window as NSString
+            let nsRemaining = remaining as NSString
+            let windowEnd = min(maxChunk, nsRemaining.length)
+            let window = nsRemaining.substring(to: windowEnd)
+            let windowNS = window as NSString
+            let atoms = atomicSpans(remaining)
             let hardStart = 60  // don't emit chunks shorter than this
 
             // Candidate split patterns in quality order.
@@ -375,7 +377,7 @@ enum TextChunker {
             for p in candidates {
                 guard let re = try? NSRegularExpression(pattern: p) else { continue }
                 // Walk all matches, pick the last one that's >= hardStart and not inside an atom.
-                let matches = re.matches(in: window, range: NSRange(location: 0, length: ns.length))
+                let matches = re.matches(in: window, range: NSRange(location: 0, length: windowNS.length))
                 for m in matches.reversed() {
                     let end = m.range.location + m.range.length
                     if end >= hardStart && !insideAtom(end, atoms: atoms) {
@@ -386,17 +388,19 @@ enum TextChunker {
             }
             if splitUtf16 == nil {
                 // Fallback: last space before end, not inside atom.
-                let lastSpace = ns.range(of: " ", options: .backwards)
+                let lastSpace = windowNS.range(of: " ", options: .backwards)
                 if lastSpace.location != NSNotFound && lastSpace.location >= hardStart &&
                    !insideAtom(lastSpace.location + 1, atoms: atoms) {
                     splitUtf16 = lastSpace.location + 1
+                } else if let atom = atoms.first(where: { windowEnd > $0.location && windowEnd < $0.location + $0.length }) {
+                    splitUtf16 = min(atom.location + atom.length, nsRemaining.length)
                 } else {
-                    // Give up — emit the whole window. Acceptable: no natural break.
-                    splitUtf16 = ns.length
+                    splitUtf16 = windowNS.length
                 }
             }
-            let head = String(ns.substring(to: splitUtf16!)).trimmingCharacters(in: .whitespaces)
-            let tail = String(ns.substring(from: splitUtf16!)) + String(remaining.dropFirst(window.count))
+            let split = min(splitUtf16!, nsRemaining.length)
+            let head = nsRemaining.substring(to: split).trimmingCharacters(in: .whitespaces)
+            let tail = nsRemaining.substring(from: split)
             if !head.isEmpty { out.append(head) }
             remaining = tail.trimmingCharacters(in: .whitespaces)
         }

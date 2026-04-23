@@ -2,6 +2,11 @@ import AVFoundation
 import Foundation
 
 final class AudioPlayer: @unchecked Sendable {
+    struct PlaybackSnapshot {
+        let currentTime: TimeInterval
+        let duration: TimeInterval
+        let paused: Bool
+    }
 
     private var audioPlayer: AVAudioPlayer?
     private let lock = NSLock()
@@ -11,11 +16,13 @@ final class AudioPlayer: @unchecked Sendable {
     /// Current playback position of the active chunk (seconds). 0 when idle.
     var currentTime: TimeInterval { audioPlayer?.currentTime ?? 0 }
 
-    func play(data: Data, rate: Float = 1.0, startAt: TimeInterval = 0) async {
-        lock.lock()
-        if cancelled { lock.unlock(); return }
-        lock.unlock()
-
+    func play(
+        data: Data,
+        rate: Float = 1.0,
+        startAt: TimeInterval = 0,
+        endAt: TimeInterval? = nil,
+        onProgress: ((PlaybackSnapshot) -> Void)? = nil
+    ) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async { [self] in
                 lock.lock()
@@ -33,15 +40,31 @@ final class AudioPlayer: @unchecked Sendable {
                     lock.unlock()
 
                     player.play()
+                    let cutoff = endAt.map { max(startAt, $0) }
                     while player.isPlaying || self.paused {
                         lock.lock()
                         let c = cancelled
                         let p = paused
                         lock.unlock()
                         if c { player.stop(); break }
+                        if let cutoff, player.currentTime >= cutoff {
+                            player.stop()
+                            break
+                        }
+                        onProgress?(PlaybackSnapshot(
+                            currentTime: player.currentTime,
+                            duration: player.duration,
+                            paused: p
+                        ))
                         if p && player.isPlaying { player.pause() }
                         Thread.sleep(forTimeInterval: 0.05)
                     }
+
+                    lock.lock()
+                    if audioPlayer === player {
+                        audioPlayer = nil
+                    }
+                    lock.unlock()
                 } catch {
                     Log.error("[PLAYER] \(error)")
                 }

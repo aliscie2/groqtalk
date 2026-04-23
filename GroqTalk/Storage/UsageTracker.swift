@@ -5,21 +5,48 @@ final class UsageTracker {
     struct DailyLog: Codable {
         var date: String
         var calls: Int = 0
-        var whisperSeconds: Double = 0
-        var llmTokens: Int = 0
+        var sttSeconds: Double = 0
         var ttsChars: Int = 0
+
+        enum CodingKeys: String, CodingKey {
+            case date, calls, sttSeconds, whisperSeconds, ttsChars
+        }
+
+        init(date: String, calls: Int = 0, sttSeconds: Double = 0, ttsChars: Int = 0) {
+            self.date = date
+            self.calls = calls
+            self.sttSeconds = sttSeconds
+            self.ttsChars = ttsChars
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            date = try c.decode(String.self, forKey: .date)
+            calls = try c.decodeIfPresent(Int.self, forKey: .calls) ?? 0
+            sttSeconds = try c.decodeIfPresent(Double.self, forKey: .sttSeconds)
+                ?? c.decodeIfPresent(Double.self, forKey: .whisperSeconds)
+                ?? 0
+            ttsChars = try c.decodeIfPresent(Int.self, forKey: .ttsChars) ?? 0
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(date, forKey: .date)
+            try c.encode(calls, forKey: .calls)
+            try c.encode(sttSeconds, forKey: .sttSeconds)
+            try c.encode(ttsChars, forKey: .ttsChars)
+        }
     }
 
     private let path = ConfigManager.configDir + "/usage.json"
 
-    func logUsage(kind: String, audioDuration: Double = 0, tokens: Int = 0, chars: Int = 0) {
+    func logUsage(kind: String, audioDuration: Double = 0, chars: Int = 0) {
         var logs = loadAll()
         let today = todayStr()
         var entry = logs.first(where: { $0.date == today }) ?? DailyLog(date: today)
         entry.calls += 1
         switch kind {
-        case "whisper": entry.whisperSeconds += audioDuration
-        case "llm": entry.llmTokens += tokens
+        case "stt": entry.sttSeconds += audioDuration
         case "tts": entry.ttsChars += chars
         default: break
         }
@@ -37,17 +64,11 @@ final class UsageTracker {
         for log in logs {
             guard let d = f.date(from: log.date), d >= cutoff else { continue }
             totals.calls += log.calls
-            totals.whisperSeconds += log.whisperSeconds
-            totals.llmTokens += log.llmTokens
+            totals.sttSeconds += log.sttSeconds
             totals.ttsChars += log.ttsChars
         }
 
-        // Groq STT is free tier; TTS is local (free)
-        let whisperCost = 0.0
-        let llmCost = Double(totals.llmTokens) / 1_000_000.0 * 0.80
-        let ttsCost = 0.0
-
-        return (whisperCost + llmCost + ttsCost, totals)
+        return (0.0, totals)
     }
 
     private func todayStr() -> String {

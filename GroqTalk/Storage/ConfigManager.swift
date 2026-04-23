@@ -1,50 +1,101 @@
 import Foundation
 
 struct ConfigManager {
-    static var shared = ConfigManager()
-
     static let sampleRate: Int = 16_000
     static let channels: Int = 1
 
-    // Local-only endpoints. mlx_audio.server hosts both Kokoro TTS and
-    // Parakeet STT on the same port (8723) — they're serialized by the
-    // _MLX_INFERENCE_LOCK patch in mlx_audio/server.py (backport of PR #594).
+    // Local-only endpoints. `mlx_audio.server` hosts Kokoro TTS and
+    // Parakeet-TDT STT on 8723. Whisper runs on dedicated whisper-server
+    // daemons so it does not contend with Kokoro inside the shared MLX process.
     static let sttMLXAudioURL   = "http://127.0.0.1:8723"
+    static let whisperSmallURL  = "http://127.0.0.1:8724"
+    static let whisperLargeURL  = "http://127.0.0.1:8725"
     static let ttsBaseURL       = "http://127.0.0.1:8723"
+    static let whisperServerBinary = "/opt/homebrew/bin/whisper-server"
+    static let whisperSmallPath = configDir + "/models/ggml-small.en.bin"
+    static let whisperLargePath = configDir + "/models/ggml-large-v3-turbo-q5_0.bin"
 
     static let sttModelID: [STTMode: String] = [
         .parakeet: "mlx-community/parakeet-tdt-0.6b-v2",
+        .whisperSmall: "mlx-community/whisper-small-asr-fp16",
+        .whisperLarge: "mlx-community/whisper-large-v3-turbo-asr-fp16",
     ]
     static let parakeetModel = sttModelID[.parakeet]!
 
-    /// Parakeet-TDT-0.6B-v2 — ~0.06s/3s-clip English ASR via mlx-audio.server.
-    /// Known weakness: no integrated LM → occasional errors on minimal pairs
-    /// ("can"/"can't", "bed"/"bet"). Voxtral-Mini-3B was evaluated as a
-    /// more-accurate alternative but mlx-audio's voxtral handler hangs
-    /// indefinitely on that checkpoint in this environment. Revisit when
-    /// an MLX port of Canary-Qwen-2.5B appears, or when mlx-audio supports
-    /// Voxtral-Realtime variants cleanly.
-    enum STTMode: String { case parakeet }
+    /// Parakeet is the low-latency default in the current local stack.
+    /// Whisper Small / Large run on dedicated whisper.cpp daemons.
+    enum STTMode: String { case parakeet, whisperSmall, whisperLarge }
     static let sttModels: [(mode: STTMode, label: String, path: String)] = [
         (.parakeet, "Parakeet", ""),
+        (.whisperSmall, "Whisper Small", whisperSmallPath),
+        (.whisperLarge, "Whisper Large", whisperLargePath),
     ]
+    static var availableSTTModels: [(mode: STTMode, label: String, path: String)] {
+        sttModels.filter { isSTTModeSelectable($0.mode) }
+    }
 
     static let systemRAM: UInt64 = ProcessInfo.processInfo.physicalMemory
     static let systemRAMGB: Int = Int(systemRAM / (1024 * 1024 * 1024))
 
-    static var defaultSTTMode: STTMode { .parakeet }
+    static var defaultSTTMode: STTMode {
+        .parakeet
+    }
+
+    private static let selectedSTTModeKey = "selectedSTTMode"
+    static var selectedSTTMode: STTMode {
+        get {
+            guard let raw = UserDefaults.standard.string(forKey: selectedSTTModeKey),
+                  let mode = STTMode(rawValue: raw) else {
+                return defaultSTTMode
+            }
+            return isSTTModeSelectable(mode) ? mode : defaultSTTMode
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: selectedSTTModeKey) }
+    }
+
+    static func isSTTModeSelectable(_ mode: STTMode) -> Bool {
+        switch mode {
+        case .parakeet:
+            return true
+        case .whisperSmall:
+            return FileManager.default.fileExists(atPath: whisperServerBinary)
+                && FileManager.default.fileExists(atPath: whisperSmallPath)
+        case .whisperLarge:
+            return FileManager.default.fileExists(atPath: whisperServerBinary)
+                && FileManager.default.fileExists(atPath: whisperLargePath)
+        }
+    }
+
+    static func sttServerURL(for mode: STTMode) -> String {
+        switch mode {
+        case .parakeet: return sttMLXAudioURL
+        case .whisperSmall: return whisperSmallURL
+        case .whisperLarge: return whisperLargeURL
+        }
+    }
+
+    static func whisperModelPath(for mode: STTMode) -> String? {
+        switch mode {
+        case .whisperSmall: return whisperSmallPath
+        case .whisperLarge: return whisperLargePath
+        case .parakeet: return nil
+        }
+    }
+
+    static func whisperPort(for mode: STTMode) -> UInt16? {
+        switch mode {
+        case .whisperSmall: return 8724
+        case .whisperLarge: return 8725
+        case .parakeet: return nil
+        }
+    }
 
     // MARK: - TTS
 
     enum TTSEngine: String { case fast }
     static let ttsEngines: [(engine: TTSEngine, label: String, model: String, voices: [String], defaultVoice: String)] = [
-        // Kokoro-82M bf16 — consistent preset voices, fully on disk already.
-        // (8-bit variant is ~40% faster but is a separate HF repo; switching
-        // mid-session triggers a fresh multi-hundred-MB download that hangs
-        // every queued TTS request behind it. Upgrade only as a deliberate
-        // pre-downloaded swap.) Fish / Qwen were tried and removed: Fish
-        // needs reference audio for voice consistency; Qwen's named speakers
-        // didn't produce the expected consistency in testing.
+        // Kokoro-82M bf16 — consistent preset voices and already available
+        // locally in this setup.
         (.fast, "Kokoro", "mlx-community/Kokoro-82M-bf16",
          ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"],
          "af_heart"),
@@ -52,7 +103,47 @@ struct ConfigManager {
     static let defaultTTSEngine: TTSEngine = .fast
     static func ttsEngineEntry(_ engine: TTSEngine) -> (label: String, model: String, voices: [String], defaultVoice: String) {
         let e = ttsEngines.first { $0.engine == engine } ?? ttsEngines[0]
-        return (e.label, e.model, e.voices, e.defaultVoice)
+        let voices = KokoroVoiceResolver.installedVoices(preferred: e.voices, model: e.model)
+        let defaultVoice = voices.contains(e.defaultVoice) ? e.defaultVoice : (voices.first ?? e.defaultVoice)
+        return (e.label, e.model, voices, defaultVoice)
+    }
+
+    private static let selectedTTSEngineKey = "selectedTTSEngine"
+    static var selectedTTSEngine: TTSEngine {
+        get {
+            guard let raw = UserDefaults.standard.string(forKey: selectedTTSEngineKey),
+                  let engine = TTSEngine(rawValue: raw) else {
+                return defaultTTSEngine
+            }
+            return engine
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: selectedTTSEngineKey) }
+    }
+
+    private static let selectedVoiceKey = "selectedVoice"
+    static var selectedVoice: String {
+        get {
+            let stored = UserDefaults.standard.string(forKey: selectedVoiceKey)
+            return preferredVoice(for: selectedTTSEngine, storedVoice: stored)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: selectedVoiceKey) }
+    }
+
+    static func preferredVoice(for engine: TTSEngine, storedVoice: String? = nil) -> String {
+        let entry = ttsEngineEntry(engine)
+        let candidate = storedVoice ?? UserDefaults.standard.string(forKey: selectedVoiceKey)
+        if let candidate, entry.voices.contains(candidate) { return candidate }
+        return entry.defaultVoice
+    }
+
+    private static let playbackRateKey = "playbackRate"
+    static var playbackRate: Float {
+        get {
+            if UserDefaults.standard.object(forKey: playbackRateKey) == nil { return 1.25 }
+            let value = UserDefaults.standard.float(forKey: playbackRateKey)
+            return value > 0 ? value : 1.25
+        }
+        set { UserDefaults.standard.set(newValue, forKey: playbackRateKey) }
     }
 
     static let dictionaryPath = configDir + "/dictionary.txt"
@@ -89,6 +180,37 @@ struct ConfigManager {
     static func loadDictionary() -> String {
         guard let content = try? String(contentsOfFile: dictionaryPath, encoding: .utf8) else { return "" }
         return content.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    struct DictionaryEntry {
+        let canonical: String
+        let aliases: [String]
+    }
+
+    static func dictionaryEntries() -> [DictionaryEntry] {
+        loadDictionary()
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+            .flatMap { line -> [DictionaryEntry] in
+                if let range = line.range(of: "=>") {
+                    let aliasPart = line[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                    let canonicalPart = line[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !aliasPart.isEmpty, !canonicalPart.isEmpty else { return [] }
+                    let aliases = aliasPart
+                        .components(separatedBy: ",")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    guard !aliases.isEmpty else { return [] }
+                    return [DictionaryEntry(canonical: canonicalPart, aliases: aliases)]
+                }
+
+                return line
+                    .components(separatedBy: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .map { DictionaryEntry(canonical: $0, aliases: []) }
+            }
     }
 
     static let silenceThreshold: Float = 0.005
@@ -145,37 +267,43 @@ import AppKit
 import UserNotifications
 
 enum NotificationHelper {
+    private static let statusNotificationID = "com.groqtalk.status"
+
     static func requestPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        Log.info("[NOTIFY] using NSUserNotificationCenter")
+        Log.info("[NOTIFY] using UserNotifications")
     }
+
     static func send(title: String = "GroqTalk", message: String) {
-        DispatchQueue.main.async {
-            let n = NSUserNotification()
-            n.title = title
-            n.informativeText = message
-            NSUserNotificationCenter.default.deliver(n)
-        }
+        post(
+            id: "com.groqtalk.message.\(UUID().uuidString)",
+            title: title,
+            subtitle: "",
+            body: message
+        )
     }
+
     static func sendStatus(_ message: String, subtitle: String = "") {
-        DispatchQueue.main.async {
-            let center = NSUserNotificationCenter.default
-            for d in center.deliveredNotifications where d.title == "GroqTalk" {
-                center.removeDeliveredNotification(d)
-            }
-            let n = NSUserNotification()
-            n.title = "GroqTalk"
-            n.subtitle = subtitle
-            n.informativeText = message
-            center.deliver(n)
-        }
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [statusNotificationID])
+        center.removePendingNotificationRequests(withIdentifiers: [statusNotificationID])
+        post(id: statusNotificationID, title: "GroqTalk", subtitle: subtitle, body: message)
     }
+
     static func clearStatus() {
-        DispatchQueue.main.async {
-            let center = NSUserNotificationCenter.default
-            for d in center.deliveredNotifications where d.title == "GroqTalk" {
-                center.removeDeliveredNotification(d)
-            }
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [statusNotificationID])
+        center.removePendingNotificationRequests(withIdentifiers: [statusNotificationID])
+    }
+
+    private static func post(id: String, title: String, subtitle: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.subtitle = subtitle
+        content.body = body
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error { Log.error("[NOTIFY] failed to deliver: \(error.localizedDescription)") }
         }
     }
 }

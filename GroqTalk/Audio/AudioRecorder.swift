@@ -92,10 +92,23 @@ final class AudioRecorder: @unchecked Sendable {
         return captured
     }
 
-    func liveBuffers() -> [AVAudioPCMBuffer] {
+    func liveBuffers(maxDuration: Double? = nil) -> [AVAudioPCMBuffer] {
         lock.lock()
         let copy = buffers
         lock.unlock()
-        return copy
+
+        guard let maxDuration, maxDuration > 0 else { return copy }
+
+        let maxFrames = Int(maxDuration * Double(ConfigManager.sampleRate))
+        var selected: [AVAudioPCMBuffer] = []
+        var collectedFrames = 0
+
+        for buffer in copy.reversed() {
+            selected.append(buffer)
+            collectedFrames += Int(buffer.frameLength)
+            if collectedFrames >= maxFrames { break }
+        }
+
+        return selected.reversed()
     }
 }

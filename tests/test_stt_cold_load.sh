@@ -1,5 +1,5 @@
 #!/bin/bash
-# Replicates the "request cancelled before Voxtral cold-load completes" bug
+# Replicates the "request cancelled before STT cold-load completes" bug
 # and verifies the warm-on-switch fix. Designed to run without the Swift app
 # — we talk directly to mlx_audio.server on port 8723, same endpoint the
 # Swift client uses.
@@ -7,7 +7,7 @@
 # Scenario:
 #   1. Kill any existing mlx_audio.server (force cold state).
 #   2. Spawn a fresh mlx_audio.server.
-#   3. Fire TWO Voxtral transcription requests back-to-back:
+#   3. Fire TWO transcription requests back-to-back:
 #        - request A: short timeout (10s) — we expect this to TIME OUT on a
 #          cold load. That IS the bug (the Swift client used to cancel at 8s).
 #        - request B: long timeout (120s) — this MUST succeed. That's what
@@ -21,10 +21,15 @@
 #   1 — something unexpected (e.g. warmed model also slow, or cold succeeded).
 #
 # Run: bash tests/test_stt_cold_load.sh
+#
+# Notes:
+#   - Defaults to the current app model (Parakeet). Override with
+#     `MODEL=... bash tests/test_stt_cold_load.sh` if you want to stress a
+#     different checkpoint manually.
 
 set -u
 PORT=8723
-MODEL="mlx-community/Voxtral-Mini-3B-2507-bf16"
+MODEL="${MODEL:-mlx-community/parakeet-tdt-0.6b-v2}"
 TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT
 
@@ -51,8 +56,13 @@ pkill -9 -f mlx_audio.server 2>/dev/null
 sleep 1
 
 echo "[setup] starting fresh mlx_audio.server on :$PORT ..."
-PYTHONUNBUFFERED=1 /opt/homebrew/bin/python3.11 -m mlx_audio.server \
-  --host 127.0.0.1 --port "$PORT" > "$TMP/server.log" 2>&1 &
+if [ -x "$HOME/.config/groqtalk/start_tts.sh" ]; then
+  "$HOME/.config/groqtalk/start_tts.sh" > "$TMP/server.log" 2>&1 &
+else
+  PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    /opt/homebrew/bin/python3.11 -m mlx_audio.server \
+    --host 127.0.0.1 --port "$PORT" > "$TMP/server.log" 2>&1 &
+fi
 SERVER=$!
 trap "kill $SERVER 2>/dev/null; rm -rf $TMP" EXIT
 

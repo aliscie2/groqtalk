@@ -1,14 +1,47 @@
 import Foundation
 
 enum SpeechService {
+    private actor FetchGate {
+        private let limit: Int
+        private var inFlight = 0
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        init(limit: Int) {
+            self.limit = limit
+        }
+
+        func acquire() async {
+            if inFlight < limit {
+                inFlight += 1
+                return
+            }
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+
+        func release() {
+            if let waiter = waiters.first {
+                waiters.removeFirst()
+                waiter.resume()
+            } else {
+                inFlight = max(0, inFlight - 1)
+            }
+        }
+    }
 
     struct LastSession {
         let text: String
-        let prettified: String
+        let rawChunks: [String]
         let chunks: [String]
+        let displayChunks: [String]
+    }
+    private struct ChunkHighlightPlan {
+        let dialogIndex: Int
+        let startWordIndex: Int
+        let playableWordCount: Int
     }
     static var lastSession: LastSession?
-    static var chunkAudio: [Int: Data] = [:]
     private static var fetchTasks: [Int: Task<Data, Error>] = [:]
     private static let maxConcurrent = 3
 
@@ -35,19 +68,21 @@ enum SpeechService {
                 return
             }
 
-            let (preview, speechChunks, showDialog) = prepareSession(text: text)
+            let (preview, speechChunks, showDialog) = prepareSession(text: text, rate: rate)
 
             if let cached = history.findCachedTTS(text: text) {
                 Log.info("[TTS] cache hit (\(cached.count) bytes)")
                 NotificationHelper.sendStatus("\u{1F50A} Speaking (cached)...", subtitle: preview)
                 try Task.checkCancellation()
                 if showDialog {
-                    for i in 0..<speechChunks.count { TTSDialog.shared.enableChunk(i) }
-                    TTSDialog.shared.setActiveChunk(0)
+                    await MainActor.run {
+                        for i in 0..<speechChunks.count { TTSDialog.shared.enableChunk(i) }
+                        TTSDialog.shared.setActiveChunk(0)
+                    }
                 }
                 await player.play(data: cached, rate: rate)
                 NotificationHelper.sendStatus("\u{2705} Done", subtitle: preview)
-                if showDialog { TTSDialog.shared.finish() }
+                if showDialog { await MainActor.run { TTSDialog.shared.finish() } }
                 try? await Task.sleep(for: .seconds(2)); NotificationHelper.clearStatus()
                 return
             }
@@ -55,7 +90,7 @@ enum SpeechService {
             NotificationHelper.sendStatus("\u{231B} Loading audio...", subtitle: preview)
             launchParallelFetches(chunks: speechChunks, api: api, voice: voice, model: model, showDialog: showDialog)
             let allWav = try await playFromCache(
-                startAt: 0, player: player, rate: rate, usage: usage, preview: preview, showDialog: showDialog
+                startAt: 0, api: api, player: player, rate: rate, usage: usage, preview: preview, showDialog: showDialog
             )
             try Task.checkCancellation()
             if !allWav.isEmpty { history.saveTTSToHistory(text: text, ttsWavBytes: allWav) }
@@ -63,7 +98,7 @@ enum SpeechService {
             let elapsed = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start)
             NotificationHelper.sendStatus("\u{2705} Done in \(elapsed)s", subtitle: preview)
             Log.info("[TTS] done in \(elapsed)s")
-            if showDialog { TTSDialog.shared.finish() }
+            if showDialog { await MainActor.run { TTSDialog.shared.finish() } }
             try? await Task.sleep(for: .seconds(2)); NotificationHelper.clearStatus()
 
         } catch is CancellationError {
@@ -82,15 +117,15 @@ enum SpeechService {
     ) async {
         player.reset()
         do {
-            let (preview, speechChunks, showDialog) = prepareSession(text: text)
+            let (preview, speechChunks, showDialog) = prepareSession(text: text, rate: rate)
             Log.info("[TTS] speakDirect \(text.count) chars -> \(speechChunks.count) chunks")
             launchParallelFetches(chunks: speechChunks, api: api, voice: voice, model: model, showDialog: showDialog)
             let allWav = try await playFromCache(
-                startAt: 0, player: player, rate: rate, usage: usage, preview: preview, showDialog: showDialog
+                startAt: 0, api: api, player: player, rate: rate, usage: usage, preview: preview, showDialog: showDialog
             )
             try Task.checkCancellation()
             if !allWav.isEmpty { history.saveTTSToHistory(text: text, ttsWavBytes: allWav) }
-            if showDialog { TTSDialog.shared.finish() }
+            if showDialog { await MainActor.run { TTSDialog.shared.finish() } }
         } catch is CancellationError {
             Log.info("[TTS] speakDirect cancelled")
         } catch {
@@ -115,11 +150,11 @@ enum SpeechService {
 
         do {
             _ = try await playFromCache(
-                startAt: startAt, player: player, rate: rate, usage: usage,
+                startAt: startAt, api: api, player: player, rate: rate, usage: usage,
                 preview: String(session.text.prefix(60)), showDialog: true, startTime: startTime
             )
             try Task.checkCancellation()
-            if ConfigManager.showTTSDialog { TTSDialog.shared.finish() }
+            if ConfigManager.showTTSDialog { await MainActor.run { TTSDialog.shared.finish() } }
         } catch is CancellationError {
             Log.info("[TTS] resume cancelled")
         } catch {
@@ -127,15 +162,93 @@ enum SpeechService {
         }
     }
 
+    static func resumeFromWord(
+        chunkIndex: Int,
+        wordIndex: Int,
+        api: GroqAPIClient,
+        player: AudioPlayer,
+        voice: String,
+        model: String,
+        rate: Float,
+        usage: UsageTracker
+    ) async {
+        guard let session = lastSession else {
+            Log.error("[TTS] resumeFromWord: no session")
+            return
+        }
+        guard let suffixChunks = WordJumpText.suffixChunks(
+            from: session.displayChunks,
+            chunkIndex: chunkIndex,
+            wordIndex: wordIndex
+        ) else {
+            Log.error("[TTS] resumeFromWord: invalid chunk/word \(chunkIndex)/\(wordIndex)")
+            return
+        }
+
+        let indexedSpeechChunks = suffixChunks.enumerated().compactMap { offset, chunk -> (Int, String)? in
+            let cleaned = TextCleaner.clean(chunk)
+            guard !cleaned.isEmpty else { return nil }
+            return (chunkIndex + offset, cleaned)
+        }
+        guard !indexedSpeechChunks.isEmpty else {
+            Log.error("[TTS] resumeFromWord: suffix produced no speech chunks")
+            return
+        }
+
+        Log.info("[TTS] resumeFromWord chunk=\(chunkIndex) word=\(wordIndex) -> \(indexedSpeechChunks.count) chunks")
+        player.reset()
+
+        let speechChunks = indexedSpeechChunks.map(\.1)
+        let dialogIndices = indexedSpeechChunks.map(\.0)
+
+        launchParallelFetches(
+            chunks: speechChunks,
+            api: api,
+            voice: voice,
+            model: model,
+            showDialog: ConfigManager.showTTSDialog,
+            dialogIndices: dialogIndices
+        )
+
+        do {
+            _ = try await playFromCache(
+                startAt: 0,
+                api: api,
+                player: player,
+                rate: rate,
+                usage: usage,
+                preview: String(speechChunks[0].prefix(60)),
+                showDialog: ConfigManager.showTTSDialog,
+                chunksOverride: speechChunks,
+                highlightIndices: dialogIndices,
+                wordStartOffsets: [wordIndex] + Array(repeating: 0, count: max(0, speechChunks.count - 1))
+            )
+            try Task.checkCancellation()
+            if ConfigManager.showTTSDialog { await MainActor.run { TTSDialog.shared.finish() } }
+        } catch is CancellationError {
+            Log.info("[TTS] resumeFromWord cancelled")
+        } catch {
+            handleError(error, tag: "TTS resumeFromWord", notify: false)
+        }
+    }
+
     // MARK: - Session helpers
 
-    private static func prepareSession(text: String) -> (preview: String, speechChunks: [String], showDialog: Bool) {
+    private static func prepareSession(text: String, rate: Float) -> (preview: String, speechChunks: [String], showDialog: Bool) {
         let rawChunks = TextChunker.split(text)
         let speechChunks = rawChunks.map { TextCleaner.clean($0) }
+        let displayChunks = rawChunks.map {
+            DialogCapabilities.plainText(from: TextPrettifier.prettify($0))
+        }
         Log.info("[TTS] \(text.count) chars -> \(rawChunks.count) chunks")
         let showDialog = ConfigManager.showTTSDialog
-        if showDialog { TTSDialog.shared.show(text: text, chunks: rawChunks) }
-        lastSession = LastSession(text: text, prettified: text, chunks: speechChunks)
+        if showDialog { TTSDialog.shared.show(text: text, chunks: rawChunks, playbackRate: rate) }
+        lastSession = LastSession(
+            text: text,
+            rawChunks: rawChunks,
+            chunks: speechChunks,
+            displayChunks: displayChunks
+        )
         return (String(text.prefix(60)), speechChunks, showDialog)
     }
 
@@ -149,75 +262,202 @@ enum SpeechService {
     // MARK: - Parallel fetch
 
     private static func launchParallelFetches(
-        chunks: [String], api: GroqAPIClient, voice: String, model: String, showDialog: Bool
+        chunks: [String],
+        api: GroqAPIClient,
+        voice: String,
+        model: String,
+        showDialog: Bool,
+        dialogIndices: [Int]? = nil
     ) {
-        chunkAudio.removeAll()
+        cancelFetchTasks()
         fetchTasks.removeAll()
         Log.info("[TTS] launching \(chunks.count) fetches (max \(maxConcurrent) concurrent)")
+        let gate = FetchGate(limit: maxConcurrent)
+        for (index, chunk) in chunks.enumerated() {
+            fetchTasks[index] = Task {
+                await gate.acquire()
+                defer { Task { await gate.release() } }
 
-        var cursor = 0
-        func launchNext() {
-            guard cursor < chunks.count else { return }
-            let i = cursor; let chunk = chunks[cursor]; cursor += 1
-            fetchTasks[i] = Task {
                 var lastError: Error?
                 for attempt in 1...2 {
                     do {
                         let data = try await api.speechData(text: chunk, voice: voice, model: model)
-                        chunkAudio[i] = data
                         if showDialog {
-                            await MainActor.run { TTSDialog.shared.enableChunk(i) }
+                            let dialogIndex = dialogIndices?[safe: index] ?? index
+                            await MainActor.run { TTSDialog.shared.enableChunk(dialogIndex) }
                         }
-                        Log.debug("[TTS] chunk \(i) fetched (\(data.count) bytes)")
-                        launchNext()
+                        Log.debug("[TTS] chunk \(index) fetched (\(data.count) bytes)")
                         return data
                     } catch {
                         lastError = error
                         if attempt < 2 {
-                            Log.info("[TTS] chunk \(i) retry after: \(error.localizedDescription)")
+                            Log.info("[TTS] chunk \(index) retry after: \(error.localizedDescription)")
                             try? await Task.sleep(for: .milliseconds(300))
                         }
                     }
                 }
-                launchNext()
                 throw lastError ?? NSError(domain: "TTS", code: -1)
             }
         }
-        for _ in 0..<min(maxConcurrent, chunks.count) { launchNext() }
+    }
+
+    private static func cancelFetchTasks() {
+        for task in fetchTasks.values {
+            task.cancel()
+        }
     }
 
     // MARK: - Play from cache
 
     private static func playFromCache(
-        startAt: Int, player: AudioPlayer, rate: Float,
+        startAt: Int, api: GroqAPIClient, player: AudioPlayer, rate: Float,
         usage: UsageTracker, preview: String, showDialog: Bool,
-        startTime: TimeInterval = 0
+        startTime: TimeInterval = 0,
+        chunksOverride: [String]? = nil,
+        highlightIndices: [Int]? = nil,
+        wordStartOffsets: [Int]? = nil
     ) async throws -> Data {
-        guard let session = lastSession else { return Data() }
-        let chunks = session.chunks
+        let chunks = chunksOverride ?? lastSession?.chunks ?? []
         guard startAt < chunks.count else { return Data() }
-        var allWav = Data()
+        var wavChunks: [Data] = []
+        wavChunks.reserveCapacity(chunks.count - startAt)
+        let session = lastSession
+        let highlightPlans = makeHighlightPlans(
+            chunkCount: chunks.count,
+            highlightIndices: highlightIndices,
+            wordStartOffsets: wordStartOffsets
+        )
+        let alignmentMode = showDialog ? TTSWordAlignmentService.preferredAlignmentMode() : nil
+        let alignmentGate = FetchGate(limit: 1)
+        let alignmentTasks: [Task<[TimedDialogWord], Never>?] = (0..<chunks.count).map { index in
+            guard let alignmentMode,
+                  let session,
+                  index < highlightPlans.count,
+                  let highlightPlan = highlightPlans[index],
+                  session.displayChunks.indices.contains(highlightPlan.dialogIndex),
+                  let fetchTask = fetchTasks[index] else {
+                return nil
+            }
+            let displayText = session.displayChunks[highlightPlan.dialogIndex]
+            let spokenText = chunks[index]
+            return Task {
+                await alignmentGate.acquire()
+                defer { Task { await alignmentGate.release() } }
+                do {
+                    let wavData = try await fetchTask.value
+                    return await TTSWordAlignmentService.alignChunk(
+                        spokenText: spokenText,
+                        displayText: displayText,
+                        startWordIndex: highlightPlan.startWordIndex,
+                        wavData: wavData,
+                        api: api,
+                        mode: alignmentMode
+                    )
+                } catch {
+                    Log.debug("[TTS ALIGN] chunk \(index) fetch/alignment setup failed: \(error.localizedDescription)")
+                    return []
+                }
+            }
+        }
+        defer {
+            alignmentTasks.forEach { $0?.cancel() }
+        }
 
         for i in startAt..<chunks.count {
             try Task.checkCancellation()
             let wavData: Data
-            if let cached = chunkAudio[i] { wavData = cached }
-            else if let task = fetchTasks[i] { wavData = try await task.value }
+            if let task = fetchTasks[i] { wavData = try await task.value }
             else { Log.error("[TTS] no fetch task for chunk \(i)"); break }
             guard !wavData.isEmpty else { break }
             try Task.checkCancellation()
 
-            allWav.append(wavData)
+            wavChunks.append(wavData)
             usage.logUsage(kind: "tts", chars: chunks[i].count)
             NotificationHelper.sendStatus("\u{1F50A} Speaking \(i + 1)/\(chunks.count)...", subtitle: preview)
-            if showDialog { TTSDialog.shared.setActiveChunk(i) }
-
-            // startTime applies only to first chunk (mid-chunk seek from jumpToChunk).
+            let highlightPlan = highlightPlans.indices.contains(i) ? highlightPlans[i] : nil
             let offset: TimeInterval = (i == startAt) ? startTime : 0
-            await player.play(data: wavData, rate: rate, startAt: offset)
+            let dialogIndex = highlightPlan?.dialogIndex ?? highlightIndices?[safe: i] ?? i
+            if showDialog {
+                await MainActor.run {
+                    TTSDialog.shared.setActiveChunk(dialogIndex)
+                    TTSDialog.shared.setActiveWord(
+                        dialogIndex: dialogIndex,
+                        wordIndex: highlightPlan?.startWordIndex
+                    )
+                }
+            }
+
+            let wordTracker = highlightPlan.map {
+                LiveWordTracker(
+                    startWordIndex: $0.startWordIndex,
+                    playableWordCount: $0.playableWordCount,
+                    startTime: offset
+                )
+            }
+            let alignmentApplier: Task<Void, Never>? =
+                if let wordTracker,
+                   alignmentTasks.indices.contains(i),
+                   let alignmentTask = alignmentTasks[i] {
+                    Task {
+                        let exactWords = await alignmentTask.value
+                        guard !Task.isCancelled, !exactWords.isEmpty else { return }
+                        wordTracker.applyExactWords(exactWords)
+                        Log.debug("[TTS ALIGN] chunk \(i) exact timings ready (\(exactWords.count) words)")
+                    }
+                } else {
+                    nil
+                }
+            var lastHighlightedWordIndex = highlightPlan?.startWordIndex
+            await player.play(
+                data: wavData,
+                rate: rate,
+                startAt: offset,
+                onProgress: { snapshot in
+                    guard showDialog else { return }
+                    guard let wordIndex = wordTracker?.currentWordIndex(
+                        currentTime: snapshot.currentTime,
+                        duration: snapshot.duration
+                    ) else { return }
+                    guard wordIndex != lastHighlightedWordIndex else { return }
+                    lastHighlightedWordIndex = wordIndex
+                    Task { @MainActor in
+                        TTSDialog.shared.setActiveWord(
+                            dialogIndex: dialogIndex,
+                            wordIndex: wordIndex
+                        )
+                    }
+                }
+            )
+            alignmentApplier?.cancel()
+            if alignmentTasks.indices.contains(i) {
+                alignmentTasks[i]?.cancel()
+            }
             if player.cancelled { break }
         }
-        return allWav
+        return AudioProcessor.concatenateWAVFiles(wavChunks) ?? Data()
+    }
+
+    private static func makeHighlightPlans(
+        chunkCount: Int,
+        highlightIndices: [Int]?,
+        wordStartOffsets: [Int]?
+    ) -> [ChunkHighlightPlan?] {
+        guard let session = lastSession else { return [] }
+
+        return (0..<chunkCount).map { index in
+            let dialogIndex = highlightIndices?[safe: index] ?? index
+            guard session.displayChunks.indices.contains(dialogIndex) else { return nil }
+            let totalWordCount = WordJumpText.wordCount(in: session.displayChunks[dialogIndex])
+            guard totalWordCount > 0 else { return nil }
+            let startWordIndex = min(max(0, wordStartOffsets?[safe: index] ?? 0), totalWordCount - 1)
+            let playableWordCount = max(0, totalWordCount - startWordIndex)
+            guard playableWordCount > 0 else { return nil }
+            return ChunkHighlightPlan(
+                dialogIndex: dialogIndex,
+                startWordIndex: startWordIndex,
+                playableWordCount: playableWordCount
+            )
+        }
     }
 
     // MARK: - Errors
@@ -234,5 +474,11 @@ enum SpeechService {
             }
         }
         return String(String(describing: err).prefix(80))
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }

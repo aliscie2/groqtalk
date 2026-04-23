@@ -6,6 +6,7 @@ import Foundation
 final class HotkeyService {
 
     static let hotkeyIDLiveDictation: UInt32 = 1
+    static let hotkeyIDDeleteLastSentence: UInt32 = 2
 
     private var hotkeyRefs: [EventHotKeyRef] = []
     fileprivate static var callbacks: [UInt32: () -> Void] = [:]
@@ -18,9 +19,13 @@ final class HotkeyService {
     fileprivate static var fnCallback: (() -> Void)?
     fileprivate static var fnDown = false
     fileprivate static var fnDirtied = false
+    fileprivate static var fnCtrlCallback: (() -> Void)?
+    fileprivate static var fnCtrlDown = false
+    fileprivate static var fnCtrlDirtied = false
     fileprivate static var ctrlOptCallback: (() -> Void)?
     fileprivate static var ctrlOptDown = false
     fileprivate static var ctrlOptDirtied = false
+    fileprivate static var transientKeyHandler: ((CGEventType, CGKeyCode) -> Bool)?
 
     fileprivate static weak var sharedTap: HotkeyService?
 
@@ -40,10 +45,15 @@ final class HotkeyService {
         if status == noErr { Log.debug("Carbon event handler installed") }
     }
 
-    // MARK: - Fn + Ctrl+Option (CGEvent tap with auto-retry)
+    // MARK: - Fn / Fn+Ctrl / Ctrl+Option (CGEvent tap with auto-retry)
 
-    func installModifierHotkeys(fnAction: @escaping () -> Void, ctrlOptAction: @escaping () -> Void) {
+    func installModifierHotkeys(
+        fnAction: @escaping () -> Void,
+        fnCtrlAction: @escaping () -> Void,
+        ctrlOptAction: @escaping () -> Void
+    ) {
         HotkeyService.fnCallback = fnAction
+        HotkeyService.fnCtrlCallback = fnCtrlAction
         HotkeyService.ctrlOptCallback = ctrlOptAction
 
         _ = tryCreateTap()
@@ -134,6 +144,12 @@ final class HotkeyService {
         Log.info("[HOTKEY] Live dictation registered (Cmd+Shift+Space)")
     }
 
+    func installDeleteLastSentenceHotkey(action: @escaping () -> Void) {
+        register(keyCode: 0x33, modifiers: UInt32(cmdKey) | UInt32(shiftKey),
+                 id: HotkeyService.hotkeyIDDeleteLastSentence, callback: action)
+        Log.info("[HOTKEY] Delete-last-sentence registered (Cmd+Shift+Delete)")
+    }
+
     func disableTap() {
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
         Log.debug("[HOTKEY] tap disabled for dialog")
@@ -144,6 +160,10 @@ final class HotkeyService {
         Log.debug("[HOTKEY] tap re-enabled")
     }
 
+    func setTransientKeyHandler(_ handler: ((CGEventType, CGKeyCode) -> Bool)?) {
+        HotkeyService.transientKeyHandler = handler
+    }
+
     func unregisterAll() {
         retryTimer?.invalidate()
         healthTimer?.invalidate()
@@ -152,7 +172,9 @@ final class HotkeyService {
         hotkeyRefs.removeAll()
         HotkeyService.callbacks.removeAll()
         HotkeyService.fnCallback = nil
+        HotkeyService.fnCtrlCallback = nil
         HotkeyService.ctrlOptCallback = nil
+        HotkeyService.transientKeyHandler = nil
         teardownTap()
     }
 }
@@ -216,12 +238,22 @@ private func modifierCallback(
             callback: HotkeyService.fnCallback, label: nil
         )
         updateSoloModifier(
+            pressed: hasFn && hasCtrl, otherMods: hasOpt || hasCmd || hasShift,
+            down: &HotkeyService.fnCtrlDown, dirtied: &HotkeyService.fnCtrlDirtied,
+            callback: HotkeyService.fnCtrlCallback, label: "fn+ctrl"
+        )
+        updateSoloModifier(
             pressed: hasCtrl && hasOpt, otherMods: hasCmd || hasShift || hasFn,
             down: &HotkeyService.ctrlOptDown, dirtied: &HotkeyService.ctrlOptDirtied,
             callback: HotkeyService.ctrlOptCallback, label: "ctrl+opt"
         )
     } else if type == .keyDown || type == .keyUp {
+        let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        if let handler = HotkeyService.transientKeyHandler, handler(type, keyCode) {
+            return nil
+        }
         if HotkeyService.fnDown { HotkeyService.fnDirtied = true }
+        if HotkeyService.fnCtrlDown { HotkeyService.fnCtrlDirtied = true }
         if HotkeyService.ctrlOptDown { HotkeyService.ctrlOptDirtied = true }
     }
 

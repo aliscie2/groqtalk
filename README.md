@@ -4,10 +4,14 @@ Voice-to-text and text-to-speech menubar app for macOS. Local-only. Lives in you
 
 ## Features
 
-- **Speech-to-text** via Parakeet-TDT v2 (`mlx-community/parakeet-tdt-0.6b-v2`). 60–120× real-time on Apple Silicon; beats Whisper-large on the English OpenASR benchmark.
+- **Speech-to-text** via selectable local engines:
+  - Parakeet-TDT v2 (`mlx-community/parakeet-tdt-0.6b-v2`) for fast dictation
+  - Whisper Large (`mlx-community/whisper-large-v3-turbo-asr-fp16`) as a second accuracy-oriented option
 - **Text-to-speech** via Kokoro (`mlx-community/Kokoro-82M-bf16`) with 9 preset voices.
 - **Smart chunking** — Apple `NLTagger` sentence segmentation with an atomic-span mask so URLs, numbers, versions, quoted strings, parentheticals, code, and markdown emphasis never get cut mid-word.
-- **Hotkeys** — Fn to dictate + auto-paste, Ctrl+Option to read selected text aloud, Cmd+Shift+Space for live dictation.
+- **Live captions + pause-aware cleanup** — recording shows a floating caption panel and uses structured STT timing for cleaner punctuation/history.
+- **Searchable history** — search transcripts, add notes, replay entries, and click timed words to hear how you said them.
+- **Hotkeys** — Fn to dictate + auto-paste, Ctrl+Option to read selected text aloud, Cmd+Shift+Space for live dictation, Cmd+Shift+Delete to remove the last dictated sentence.
 - **Custom dictionary** for domain-specific terms.
 - **100% local** — no cloud, no API keys, no network.
 
@@ -78,6 +82,7 @@ Add domain-specific words/phrases (one per line) to `~/.config/groqtalk/dictiona
 | `Fn` (tap) | Toggle recording → transcribe + paste |
 | `Ctrl+Option` (tap) | Read selected text aloud (TTS) |
 | `Cmd+Shift+Space` | Live dictation |
+| `Cmd+Shift+Delete` | Delete the last dictated sentence |
 
 ## License
 

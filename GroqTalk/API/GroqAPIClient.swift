@@ -1,9 +1,8 @@
 import Foundation
 
 /// Thin HTTP client for the local TTS/STT servers this app spawns.
-/// All cloud paths (Groq, OpenAI) have been removed — the app is local-only.
-/// Class name is kept as `GroqAPIClient` for binary-compat with existing call
-/// sites; functionally it no longer touches any cloud service.
+/// The historical class name is kept so existing call sites do not need to
+/// change, but the implementation is now entirely local-only.
 final class GroqAPIClient: @unchecked Sendable {
 
     private let session: URLSession
@@ -15,21 +14,22 @@ final class GroqAPIClient: @unchecked Sendable {
         self.session = URLSession(configuration: config)
     }
 
-    // MARK: - Parakeet STT via mlx_audio.server (port 8723, shared with Kokoro TTS)
-
-    func transcribeMLXAudio(
+    private func multipartRequest(
+        url: URL,
         wavData: Data,
-        language: String = "en",
-        model: String = ConfigManager.parakeetModel
-    ) async throws -> String {
+        fields: [(String, String)],
+        timeout: TimeInterval
+    ) -> URLRequest {
         let boundary = UUID().uuidString
-        var request = URLRequest(url: URL(string: "\(ConfigManager.sttMLXAudioURL)/v1/audio/transcriptions")!)
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 120
+        request.timeoutInterval = timeout
 
         var body = Data()
-        func append(_ str: String) { body.append(str.data(using: .utf8)!) }
+        func append(_ string: String) {
+            body.append(string.data(using: .utf8)!)
+        }
 
         append("--\(boundary)\r\n")
         append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
@@ -37,38 +37,104 @@ final class GroqAPIClient: @unchecked Sendable {
         body.append(wavData)
         append("\r\n")
 
-        let fields = [("model", model), ("language", language)]
         for (key, value) in fields {
             append("--\(boundary)\r\n")
             append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
             append("\(value)\r\n")
         }
         append("--\(boundary)--\r\n")
-
         request.httpBody = body
+        return request
+    }
+
+    private func checkedData(
+        for request: URLRequest,
+        logTag: String,
+        errorPrefix: String
+    ) async throws -> Data {
         let (data, response) = try await session.data(for: request)
 
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             let body = String(data: data, encoding: .utf8) ?? "unknown error"
-            Log.error("[STT PARAKEET] HTTP \(http.statusCode): \(body)")
-            throw NSError(domain: "GroqTalk", code: http.statusCode,
-                          userInfo: [NSLocalizedDescriptionKey: "Parakeet error \(http.statusCode): \(body)"])
+            Log.error("[\(logTag)] HTTP \(http.statusCode): \(body)")
+            throw NSError(
+                domain: "GroqTalk",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "\(errorPrefix) \(http.statusCode): \(body)"]
+            )
         }
 
-        // mlx_audio.server streams JSON lines; join and pull final accumulated
-        let raw = String(data: data, encoding: .utf8) ?? ""
-        var finalText = ""
-        for line in raw.split(separator: "\n") {
-            guard let lineData = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
-            if let acc = obj["accumulated"] as? String { finalText = acc }
-            else if let t = obj["text"] as? String { finalText += t }
+        return data
+    }
+
+    // MARK: - Parakeet STT via mlx_audio.server (port 8723, shared with Kokoro TTS)
+
+    func transcribeMLXAudio(
+        wavData: Data,
+        language: String = "en",
+        model: String = ConfigManager.parakeetModel
+    ) async throws -> String {
+        try await transcribeMLXAudioDetails(wavData: wavData, language: language, model: model, verbose: false).text
+    }
+
+    func transcribeMLXAudioDetails(
+        wavData: Data,
+        language: String = "en",
+        model: String = ConfigManager.parakeetModel,
+        verbose: Bool = true
+    ) async throws -> StructuredTranscript {
+        let request = multipartRequest(
+            url: URL(string: "\(ConfigManager.sttMLXAudioURL)/v1/audio/transcriptions")!,
+            wavData: wavData,
+            fields: [
+            ("model", model),
+            ("language", language),
+            ("verbose", verbose ? "true" : "false"),
+            ],
+            timeout: 120
+        )
+        let data = try await checkedData(for: request, logTag: "STT PARAKEET", errorPrefix: "Parakeet error")
+        return StructuredTranscriptBuilder.fromNDJSON(data)
+    }
+
+    // MARK: - Dedicated Whisper via whisper-server (8724 / 8725)
+
+    func transcribeWhisperServer(
+        wavData: Data,
+        language: String = "en",
+        baseURL: String
+    ) async throws -> String {
+        try await transcribeWhisperServerDetails(
+            wavData: wavData,
+            language: language,
+            baseURL: baseURL,
+            verbose: false
+        ).text
+    }
+
+    func transcribeWhisperServerDetails(
+        wavData: Data,
+        language: String = "en",
+        baseURL: String,
+        verbose: Bool = true
+    ) async throws -> StructuredTranscript {
+        var fields = [
+            ("language", language),
+            ("response_format", verbose ? "verbose_json" : "json"),
+            ("temperature", "0.0"),
+        ]
+        let prompt = ConfigManager.loadDictionary()
+        if !prompt.isEmpty {
+            fields.append(("prompt", prompt))
         }
-        if finalText.isEmpty, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let t = obj["text"] as? String {
-            finalText = t
-        }
-        return finalText
+        let request = multipartRequest(
+            url: URL(string: "\(baseURL)/inference")!,
+            wavData: wavData,
+            fields: fields,
+            timeout: 180
+        )
+        let data = try await checkedData(for: request, logTag: "STT WHISPER", errorPrefix: "Whisper error")
+        return StructuredTranscriptBuilder.fromNDJSON(data)
     }
 
     // MARK: - Kokoro TTS via mlx_audio.server (port 8723)
@@ -79,22 +145,23 @@ final class GroqAPIClient: @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 120
 
+        let fallbackVoice = ConfigManager.ttsEngineEntry(ConfigManager.selectedTTSEngine).defaultVoice
+        let runtimeVoice = KokoroVoiceResolver.runtimeVoiceSpecifier(
+            voice: voice,
+            model: model,
+            fallbackVoice: fallbackVoice
+        )
+        if runtimeVoice != voice {
+            Log.info("[TTS API] resolved voice \(voice) locally")
+        }
+
         let payload: [String: Any] = [
             "model": model,
             "input": text,
-            "voice": voice,
+            "voice": runtimeVoice,
             "response_format": "wav"
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (data, response) = try await session.data(for: request)
-
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            let body = String(data: data, encoding: .utf8) ?? "unknown error"
-            Log.error("[TTS API] HTTP \(http.statusCode): \(body)")
-            throw NSError(domain: "GroqTalk", code: http.statusCode,
-                          userInfo: [NSLocalizedDescriptionKey: "TTS API error \(http.statusCode): \(body)"])
-        }
-
-        return data
+        return try await checkedData(for: request, logTag: "TTS API", errorPrefix: "TTS API error")
     }
 }

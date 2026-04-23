@@ -1,6 +1,6 @@
 import AppKit
 
-final class StatusBarController: NSObject {
+final class StatusBarController: NSObject, NSMenuDelegate {
 
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
@@ -38,10 +38,12 @@ final class StatusBarController: NSObject {
         statusItem.button?.title = ConfigManager.iconIdle
         menu = NSMenu()
         menu.autoenablesItems = false
+        menu.delegate = self
 
         add("Speech \u{2192} Text  (Fn)", action: #selector(handleRecord))
         add("Speak Selection  (Ctrl+Option)", action: #selector(handleSpeak))
         add("Live Dictation (Cmd+Shift+Space)", action: #selector(handleLiveDictation))
+        add("Delete Last Sentence (Cmd+Shift+Delete)", action: #selector(handleDeleteLastSentence))
         stopItem = add("\u{23F9} Stop", action: #selector(handleStop))
         stopItem.isHidden = true
         menu.addItem(.separator())
@@ -51,16 +53,17 @@ final class StatusBarController: NSObject {
         textsSubmenu = makeSubmenu()
         add("Recent Texts", submenu: textsSubmenu)
         buildHistoryItems()
+        add("Search History...", action: #selector(handleOpenHistorySearch))
         menu.addItem(.separator())
 
         denoiseItem = add("Denoise Recording (experimental)", action: #selector(handleToggleDenoise))
         denoiseItem.state = ConfigManager.denoiseBeforeSTT ? .on : .off
 
         sttSubmenu = makeSubmenu()
-        for entry in ConfigManager.sttModels {
+        for entry in ConfigManager.availableSTTModels {
             let mi = add(entry.label, action: #selector(handleSetSTTMode(_:)), to: sttSubmenu)
             mi.representedObject = entry.mode.rawValue
-            mi.state = entry.mode == ConfigManager.defaultSTTMode ? .on : .off
+            mi.state = entry.mode == ConfigManager.selectedSTTMode ? .on : .off
         }
         add("STT Engine", submenu: sttSubmenu)
 
@@ -68,23 +71,25 @@ final class StatusBarController: NSObject {
         for entry in ConfigManager.ttsEngines {
             let mi = add(entry.label, action: #selector(handleSetTTSEngine(_:)), to: ttsSubmenu)
             mi.representedObject = entry.engine.rawValue
-            mi.state = entry.engine == ConfigManager.defaultTTSEngine ? .on : .off
+            mi.state = entry.engine == ConfigManager.selectedTTSEngine ? .on : .off
         }
         add("TTS Engine", submenu: ttsSubmenu)
 
         voiceSubmenu = makeSubmenu()
-        rebuildVoiceSubmenu(for: ConfigManager.defaultTTSEngine)
+        voiceSubmenu.delegate = self
+        rebuildVoiceSubmenu(for: ConfigManager.selectedTTSEngine)
         add("Voice", submenu: voiceSubmenu)
 
         speedSubmenu = makeSubmenu()
         for rate in ["0.75x", "1.0x", "1.25x", "1.5x", "1.75x", "2.0x"] {
             let si = add(rate, action: #selector(handleSetSpeed(_:)), to: speedSubmenu)
-            si.state = rate == "1.25x" ? .on : .off
+            si.state = abs((Float(rate.replacingOccurrences(of: "x", with: "")) ?? 1.25) - ConfigManager.playbackRate) < 0.001 ? .on : .off
         }
         add("Playback Speed", submenu: speedSubmenu)
 
         dialogItem = add("Show TTS Dialog", action: #selector(handleToggleDialog))
         dialogItem.state = ConfigManager.showTTSDialog ? .on : .off
+        add("Export Session Markdown", action: #selector(handleExportSession))
         costItem = add("Usage: $0.00 (3 days)", action: #selector(handleRefreshCost))
         menu.addItem(.separator())
         add("Edit Dictionary...", action: #selector(handleEditDictionary))
@@ -139,38 +144,47 @@ final class StatusBarController: NSObject {
         DispatchQueue.main.async { [weak self] in self?.buildHistoryItems() }
     }
 
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        guard menu == voiceSubmenu, let voice = item?.representedObject as? String else { return }
+        appDelegate?.previewVoice(voice)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        if menu == voiceSubmenu || menu == self.menu {
+            appDelegate?.stopVoicePreview()
+        }
+    }
+
     private func buildHistoryItems() {
         guard let delegate = appDelegate else { return }
         let entries = delegate.history.load()
         audiosSubmenu.removeAllItems()
         textsSubmenu.removeAllItems()
-        var audioCount = 0
-        for entry in entries.reversed() {
-            guard let ttsPath = entry.ttsWavPath, FileManager.default.fileExists(atPath: ttsPath) else { continue }
+        let recentAudios = HistoryManager.recentAudioEntries(from: entries, limit: 10)
+        for entry in recentAudios {
+            guard let ttsPath = entry.ttsWavPath else { continue }
             let ago = HistoryManager.relativeTime(entry.timestamp)
-            let preview = String((entry.cleaned ?? "").prefix(40))
+            let preview = String((HistoryManager.displayText(for: entry) ?? "[saved audio]").prefix(40))
             let item = add("\(ago) -- \(preview)", action: #selector(handleReplaySpoken(_:)), to: audiosSubmenu)
-            item.representedObject = entry.cleaned ?? ""
-            audioCount += 1
+            item.representedObject = ttsPath
+            item.toolTip = HistoryManager.displayText(for: entry) ?? ttsPath
         }
-        if audioCount == 0 { audiosSubmenu.addItem(NSMenuItem(title: "(none)", action: nil, keyEquivalent: "")) }
-        var textCount = 0
-        for entry in entries.reversed() {
-            guard entry.pending == true, entry.wavPath != nil else { continue }
+        if recentAudios.isEmpty { audiosSubmenu.addItem(NSMenuItem(title: "(none)", action: nil, keyEquivalent: "")) }
+
+        let recentTexts = HistoryManager.recentTextEntries(from: entries, limit: 10)
+        for entry in recentTexts {
             let ago = HistoryManager.relativeTime(entry.timestamp)
-            let item = add("\u{1F504} \(ago) -- [tap to retry transcription]", action: #selector(handleRetryPending(_:)), to: textsSubmenu)
-            item.representedObject = entry.timestamp
-            textCount += 1
+            if entry.pending == true {
+                let item = add("\u{1F504} \(ago) -- [tap to retry transcription]", action: #selector(handleRetryPending(_:)), to: textsSubmenu)
+                item.representedObject = entry.timestamp
+                item.toolTip = "Retry this saved recording"
+            } else if let text = HistoryManager.displayText(for: entry) {
+                let item = add("\(ago) -- \(String(text.prefix(40)))", action: #selector(handleReuseText(_:)), to: textsSubmenu)
+                item.representedObject = text
+                item.toolTip = text
+            }
         }
-        for entry in entries.reversed() {
-            let text = entry.cleaned ?? entry.transcript
-            guard let text, !text.isEmpty, entry.wavPath != nil else { continue }
-            let ago = HistoryManager.relativeTime(entry.timestamp)
-            let item = add("\(ago) -- \(String(text.prefix(40)))", action: #selector(handleReuseText(_:)), to: textsSubmenu)
-            item.representedObject = text
-            textCount += 1
-        }
-        if textCount == 0 { textsSubmenu.addItem(NSMenuItem(title: "(none)", action: nil, keyEquivalent: "")) }
+        if recentTexts.isEmpty { textsSubmenu.addItem(NSMenuItem(title: "(none)", action: nil, keyEquivalent: "")) }
     }
 
     // MARK: - Cost
@@ -213,8 +227,9 @@ final class StatusBarController: NSObject {
     // MARK: - Actions
 
     @objc private func handleRecord(_ sender: NSMenuItem) { appDelegate?.toggleRecording() }
-    @objc private func handleSpeak(_ sender: NSMenuItem) { appDelegate?.speakSelected() }
+    @objc private func handleSpeak(_ sender: NSMenuItem) { appDelegate?.toggleSpeakSelection() }
     @objc private func handleLiveDictation(_ sender: NSMenuItem) { appDelegate?.toggleLiveDictation() }
+    @objc private func handleDeleteLastSentence(_ sender: NSMenuItem) { appDelegate?.deleteLastDictationSentence() }
     @objc private func handleStop(_ sender: NSMenuItem) { appDelegate?.stopAll() }
 
     @objc private func handleToggleDenoise(_ sender: NSMenuItem) {
@@ -233,10 +248,8 @@ final class StatusBarController: NSObject {
               let mode = ConfigManager.STTMode(rawValue: raw) else { return }
         d.sttMode = mode
         selectRadio(in: sttSubmenu) { ($0.representedObject as? String) == raw }
-        // Kick off a silent warmup so the first real press doesn't wait on
-        // the cold model load. Critical for Voxtral (8.7 GB) which takes
-        // 10-30s to load; without this the user presses Fn, records a short
-        // clip, and cancels before the server finishes loading.
+        // Kick off a silent warmup so the first real dictation request does
+        // not pay the model cold-load penalty right after an engine switch.
         d.warmSTT(mode: mode)
     }
 
@@ -251,7 +264,7 @@ final class StatusBarController: NSObject {
               let engine = ConfigManager.TTSEngine(rawValue: raw) else { return }
         d.ttsEngine = engine
         let entry = ConfigManager.ttsEngineEntry(engine)
-        d.currentVoice = entry.defaultVoice
+        d.currentVoice = ConfigManager.preferredVoice(for: engine)
         selectRadio(in: ttsSubmenu) { ($0.representedObject as? String) == raw }
         rebuildVoiceSubmenu(for: engine)
         Log.info("[TTS] engine switched to \(entry.label) — model \(entry.model)")
@@ -276,15 +289,17 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func handleRefreshCost(_ sender: NSMenuItem) { refreshCost() }
+    @objc private func handleExportSession(_ sender: NSMenuItem) { appDelegate?.exportSessionMarkdown() }
+    @objc private func handleOpenHistorySearch(_ sender: NSMenuItem) { appDelegate?.openHistorySearch() }
 
     @objc private func handleReplaySpoken(_ sender: NSMenuItem) {
-        guard let text = sender.representedObject as? String, !text.isEmpty else { return }
-        appDelegate?.reuseText(text)
+        guard let path = sender.representedObject as? String, !path.isEmpty else { return }
+        appDelegate?.replayEntry(path: path)
     }
 
     @objc private func handleReuseText(_ sender: NSMenuItem) {
         guard let text = sender.representedObject as? String else { return }
-        appDelegate?.reuseText(text)
+        appDelegate?.insertRecentText(text)
     }
 
     @objc private func handleRetryPending(_ sender: NSMenuItem) {

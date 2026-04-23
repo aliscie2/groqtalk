@@ -6,23 +6,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let api = GroqAPIClient()
     let recorder = AudioRecorder()
     let player = AudioPlayer()
+    private let previewPlayer = AudioPlayer()
+    private let clipPlayer = AudioPlayer()
     let hotkeys = HotkeyService()
     let history = HistoryManager()
     let usage = UsageTracker()
+    private let historySearchPanel = HistorySearchPanel()
+    private let recentTextPicker = RecentTextPickerPanel.shared
     var statusBar: StatusBarController!
     private var kokoroProcess: Process?
+    private var whisperSmallProcess: Process?
+    private var whisperLargeProcess: Process?
 
     // MARK: - State
     enum AppState { case idle, recording, processing, speaking }
     var appState: AppState = .idle { didSet { statusBar?.updateIcon(appState) } }
-    var sttMode: ConfigManager.STTMode = ConfigManager.defaultSTTMode
-    var ttsEngine: ConfigManager.TTSEngine = ConfigManager.defaultTTSEngine
-    var currentVoice = ConfigManager.ttsEngineEntry(ConfigManager.defaultTTSEngine).defaultVoice
-    var playbackRate: Float = 1.25
+    var sttMode: ConfigManager.STTMode = ConfigManager.selectedSTTMode {
+        didSet {
+            ConfigManager.selectedSTTMode = sttMode
+            syncSelectedSTTServers()
+        }
+    }
+    var ttsEngine: ConfigManager.TTSEngine = ConfigManager.selectedTTSEngine {
+        didSet { ConfigManager.selectedTTSEngine = ttsEngine }
+    }
+    var currentVoice = ConfigManager.selectedVoice {
+        didSet { ConfigManager.selectedVoice = currentVoice }
+    }
+    var playbackRate: Float = ConfigManager.playbackRate {
+        didSet { ConfigManager.playbackRate = playbackRate }
+    }
     var currentTTSModel: String { ConfigManager.ttsEngineEntry(ttsEngine).model }
     private var sttTask: Task<Void, Never>?
     private var ttsTask: Task<Void, Never>?
     private var liveTask: Task<Void, Never>?
+    private var previewTask: Task<Void, Never>?
+    private var clipTask: Task<Void, Never>?
+    private var previewCache: [String: Data] = [:]
+    private var previewVoiceName: String?
+    private var dictationInsertionTarget: ClipboardService.InsertionTarget?
+    private var lastExternalInsertionTarget: ClipboardService.InsertionTarget?
+    private let sessionStartedAt = Date()
 
     // MARK: - Lifecycle
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -37,23 +61,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Feed mic RMS to the recording indicator so the VU-meter bars react.
         recorder.onLevel = { level in RecordingIndicator.shared.setLevel(level) }
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
+        TTSDialog.shared.onWordTap = { [weak self] chunkIndex, wordIndex in
+            self?.jumpToWord(chunkIndex: chunkIndex, wordIndex: wordIndex)
+        }
+        TTSDialog.shared.voiceOptionsProvider = { [weak self] in
+            guard let self else { return ([], "") }
+            return (ConfigManager.ttsEngineEntry(self.ttsEngine).voices, self.currentVoice)
+        }
+        TTSDialog.shared.onChunkVoiceSelect = { [weak self] index, voice in
+            self?.speakDialogChunk(index: index, voice: voice)
+        }
         TTSDialog.shared.onPauseToggle = { [weak self] in
             guard let self else { return }
             self.player.togglePause()
             TTSDialog.shared.setPaused(self.player.paused)
         }
+        TTSDialog.shared.onRecordToggle = { [weak self] in
+            self?.toggleRecording()
+        }
         TTSDialog.shared.onClose = { [weak self] in
-            self?.ttsTask?.cancel(); self?.player.stop()
-            self?.appState = .idle; self?.statusBar.setStopVisible(false)
-            TTSDialog.shared.close()
+            self?.closeSpeechWindow()
+        }
+        historySearchPanel.onSpeakEntry = { [weak self] timestamp in
+            self?.speakHistoryEntry(timestamp: timestamp)
+        }
+        historySearchPanel.onPlayWord = { [weak self] timestamp, start, end in
+            self?.playHistoryWord(timestamp: timestamp, start: start, end: end)
+        }
+        historySearchPanel.onEditNote = { [weak self] timestamp in
+            self?.editHistoryNote(timestamp: timestamp)
+        }
+        recentTextPicker.onSelect = { [weak self] text in
+            self?.insertRecentText(text)
+        }
+        recentTextPicker.onDismiss = { [weak self] in
+            self?.hotkeys.setTransientKeyHandler(nil)
         }
         ModelLifecycle.kokoroStart  = { [weak self] in self?.startKokoroServer() }
         ModelLifecycle.kokoroStop   = { [weak self] in self?.stopKokoroServer() }
         startKokoroServer()
         ModelLifecycle.markKokoroStarted()
-        // Parakeet STT rides on the same mlx_audio.server as Kokoro, no
-        // separate process to spawn. The serialization lock in server.py
-        // prevents TTS/STT concurrent-eval crashes.
+        syncSelectedSTTServers()
+        // Parakeet rides on the shared mlx_audio server with Kokoro.
+        // Whisper Small / Large use dedicated whisper-server daemons so they
+        // do not destabilize the shared MLX TTS/STT runtime.
 
         // Pre-warm Kokoro ~2s after launch so the first real TTS request
         // doesn't pay cold-start cost (~0.5-1.2s on M5 Max per mlx-audio).
@@ -61,12 +112,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? await Task.sleep(for: .seconds(2))
             _ = try? await api.speechData(
                 text: ".",
-                voice: ConfigManager.ttsEngineEntry(ConfigManager.defaultTTSEngine).defaultVoice,
-                model: ConfigManager.ttsEngineEntry(ConfigManager.defaultTTSEngine).model
+                voice: ConfigManager.preferredVoice(for: ConfigManager.selectedTTSEngine),
+                model: ConfigManager.ttsEngineEntry(ConfigManager.selectedTTSEngine).model
             )
             Log.info("[TTS] pre-warm complete")
         }
-        Log.info("GroqTalk started — Fn (Record) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: parakeet | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
+        Log.info("GroqTalk started — Fn (Record) | Fn+Ctrl (Recent Texts) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue) | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
     }
 
     // MARK: - Server spawn (table-driven)
@@ -75,7 +126,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// lives in `run(_:)`.
     private struct ServerSpec {
         let name: String
-        let port: UInt16
         let logFile: String      // "" → /dev/null
         let shouldRestart: () -> Bool
         let launcher: () -> Process?
@@ -89,7 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func run(_ spec: ServerSpec) {
         guard let proc = spec.launcher() else { return }
-        if !spec.logFile.isEmpty, let fh = Self.truncatingLogHandle(at: spec.logFile) {
+        if !spec.logFile.isEmpty, let fh = Self.appendingLogHandle(at: spec.logFile) {
             proc.standardOutput = fh; proc.standardError = fh
         } else {
             proc.standardOutput = FileHandle.nullDevice
@@ -133,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Returns an append-mode handle so we keep any Python traceback from a
     /// previous crashing process. Previously we truncated on every spawn,
     /// which wiped the evidence before debugging could read it.
-    private static func truncatingLogHandle(at path: String) -> FileHandle? {
+    private static func appendingLogHandle(at path: String) -> FileHandle? {
         let url = URL(fileURLWithPath: path)
         if !FileManager.default.fileExists(atPath: path) {
             try? "".write(to: url, atomically: true, encoding: .utf8)
@@ -184,7 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Kokoro TTS Server (8723)
     func startKokoroServer() {
         run(ServerSpec(
-            name: "KOKORO", port: 8723,
+            name: "KOKORO",
             logFile: ConfigManager.configDir + "/tts_server.log",
             shouldRestart: { true },
             launcher: { [weak self] in
@@ -224,14 +274,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.info("[KOKORO] server stopped (idle unload)")
     }
 
+    // MARK: - Dedicated Whisper Servers (8724 / 8725)
+    private func syncSelectedSTTServers() {
+        switch sttMode {
+        case .parakeet:
+            stopWhisperServer(.whisperSmall)
+            stopWhisperServer(.whisperLarge)
+        case .whisperSmall:
+            startWhisperServer(.whisperSmall)
+            stopWhisperServer(.whisperLarge)
+        case .whisperLarge:
+            startWhisperServer(.whisperLarge)
+            stopWhisperServer(.whisperSmall)
+        }
+    }
+
+    private func whisperProcess(for mode: ConfigManager.STTMode) -> Process? {
+        switch mode {
+        case .whisperSmall: return whisperSmallProcess
+        case .whisperLarge: return whisperLargeProcess
+        case .parakeet: return nil
+        }
+    }
+
+    private func setWhisperProcess(_ process: Process?, for mode: ConfigManager.STTMode) {
+        switch mode {
+        case .whisperSmall: whisperSmallProcess = process
+        case .whisperLarge: whisperLargeProcess = process
+        case .parakeet: break
+        }
+    }
+
+    private func whisperProcessPattern(for mode: ConfigManager.STTMode) -> String {
+        let port = ConfigManager.whisperPort(for: mode) ?? 0
+        return "whisper-server.*--port \(port)"
+    }
+
+    private func whisperLogPath(for mode: ConfigManager.STTMode) -> String {
+        switch mode {
+        case .whisperSmall: return ConfigManager.configDir + "/stt_whisper_small.log"
+        case .whisperLarge: return ConfigManager.configDir + "/stt_whisper_large.log"
+        case .parakeet: return ConfigManager.configDir + "/stt_whisper.log"
+        }
+    }
+
+    private func whisperArguments(for mode: ConfigManager.STTMode) -> [String]? {
+        guard let modelPath = ConfigManager.whisperModelPath(for: mode),
+              let port = ConfigManager.whisperPort(for: mode) else {
+            return nil
+        }
+
+        return [
+            "--model", modelPath,
+            "--host", "127.0.0.1",
+            "--port", String(port),
+            "--language", "en",
+            "--flash-attn",
+            "-bs", "1",
+        ]
+    }
+
+    private func startWhisperServer(_ mode: ConfigManager.STTMode) {
+        guard mode != .parakeet else { return }
+        guard ConfigManager.isSTTModeSelectable(mode) else {
+            Log.error("[\(mode.rawValue)] whisper prerequisites missing")
+            NotificationHelper.sendStatus("\u{274C} \(mode.rawValue) model not available locally")
+            return
+        }
+        guard whisperProcess(for: mode) == nil else { return }
+
+        let name = mode == .whisperSmall ? "WHISPER-SMALL" : "WHISPER-LARGE"
+        let port = ConfigManager.whisperPort(for: mode) ?? 0
+
+        run(ServerSpec(
+            name: name,
+            logFile: whisperLogPath(for: mode),
+            shouldRestart: { [weak self] in self?.sttMode == mode },
+            launcher: { [weak self] in
+                guard let self else { return nil }
+                guard let args = self.whisperArguments(for: mode) else { return nil }
+                self.killExisting(pattern: self.whisperProcessPattern(for: mode), port: port)
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: ConfigManager.whisperServerBinary)
+                proc.arguments = args
+                var env = ProcessInfo.processInfo.environment
+                env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+                proc.environment = env
+                proc.currentDirectoryURL = URL(fileURLWithPath: ConfigManager.configDir)
+                return proc
+            },
+            getProcess: { [weak self] in self?.whisperProcess(for: mode) },
+            setProcess: { [weak self] process in self?.setWhisperProcess(process, for: mode) }
+        ))
+    }
+
+    private func stopWhisperServer(_ mode: ConfigManager.STTMode) {
+        guard mode != .parakeet else { return }
+        whisperProcess(for: mode)?.terminate()
+        setWhisperProcess(nil, for: mode)
+        if let port = ConfigManager.whisperPort(for: mode) {
+            killExisting(pattern: whisperProcessPattern(for: mode), port: port)
+        }
+        Log.info("[\(mode.rawValue)] whisper server stopped")
+    }
+
     // MARK: - Hotkeys
     private func setupHotkeys() {
         hotkeys.install()
         hotkeys.installModifierHotkeys(
             fnAction: { [weak self] in self?.toggleRecording() },
-            ctrlOptAction: { [weak self] in self?.speakSelected() }
+            fnCtrlAction: { [weak self] in self?.toggleRecentTextPicker() },
+            ctrlOptAction: { [weak self] in self?.toggleSpeakSelection() }
         )
         hotkeys.installLiveDictationHotkey { [weak self] in self?.toggleLiveDictation() }
+        hotkeys.installDeleteLastSentenceHotkey { [weak self] in self?.deleteLastDictationSentence() }
     }
 
     // MARK: - Live Dictation
@@ -243,10 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startLiveDictation() {
         guard appState == .idle else { return }
         do {
-            try recorder.start(); SoundCue.recordStart(); appState = .recording
-            RecordingIndicator.shared.show()
-            NotificationHelper.sendStatus("\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop")
-            startLiveTranscription()
+            try beginCapture(status: "\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop")
         } catch {
             Log.error("[LIVE] failed to start: \(error)"); appState = .idle
         }
@@ -254,8 +407,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func stopLiveDictation() {
         guard appState == .recording else { return }
-        liveTask?.cancel(); SoundCue.recordStop(); _ = recorder.stop()
+        let liveDrainTask = liveTask
+        liveTask = nil
+        liveDrainTask?.cancel()
+        SoundCue.recordStop(); _ = recorder.stop()
         RecordingIndicator.shared.hide()
+        LiveCaptionPanel.shared.hide()
         appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[LIVE] dictation stopped")
@@ -264,32 +421,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Recording (STT)
     func toggleRecording() {
         if appState == .recording { stopRecording() }
+        else if appState == .speaking {
+            interruptSpeechForRecording()
+            startRecording()
+        }
         else if appState == .idle { startRecording() }
     }
 
     func startRecording() {
         guard appState == .idle else { return }
+        dictationInsertionTarget = captureInsertionTargetForNextAction()
         do {
-            try recorder.start(); SoundCue.recordStart(); appState = .recording
-            RecordingIndicator.shared.show()
-            NotificationHelper.sendStatus("\u{1F534} Recording... Press Fn to stop")
-            startLiveTranscription()
+            try beginCapture(status: "\u{1F534} Recording... Press Fn to stop")
         } catch {
+            dictationInsertionTarget = nil
             Log.error("[REC] failed: \(error)"); appState = .idle
         }
     }
 
     func stopRecording() {
         guard appState == .recording else { return }
-        liveTask?.cancel(); SoundCue.recordStop()
+        let liveDrainTask = liveTask
+        liveTask = nil
+        liveDrainTask?.cancel()
+        SoundCue.recordStop()
         RecordingIndicator.shared.hide()
+        LiveCaptionPanel.shared.hide()
         let buffers = recorder.stop()
+        let insertionTarget = dictationInsertionTarget
+        dictationInsertionTarget = nil
         appState = .processing; statusBar.setStopVisible(true)
         sttTask = Task { [weak self] in
             guard let self else { return }
             await TranscriptionService.process(
                 buffers: buffers, api: api,
-                history: history, usage: usage, sttMode: sttMode
+                history: history, usage: usage,
+                sttMode: sttMode,
+                insertionTarget: insertionTarget
             )
             await self.finishSpeech(refresh: true)
         }
@@ -298,17 +466,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startLiveTranscription() {
         liveTask = Task { [weak self] in
             guard let self else { return }
-            await TranscriptionService.liveLoop(recorder: recorder, api: api, usage: usage, sttMode: sttMode)
+            await TranscriptionService.liveLoop(
+                recorder: recorder,
+                api: api,
+                sttMode: sttMode
+            ) { partial in
+                LiveCaptionPanel.shared.update(text: partial)
+            }
         }
+    }
+
+    private func beginCapture(status: String) throws {
+        stopAuxiliaryPlayback()
+        try recorder.start()
+        SoundCue.recordStart()
+        appState = .recording
+        RecordingIndicator.shared.show()
+        LiveCaptionPanel.shared.show()
+        NotificationHelper.sendStatus(status)
+        startLiveTranscription()
+    }
+
+    private func captureInsertionTargetForNextAction() -> ClipboardService.InsertionTarget? {
+        guard let captured = ClipboardService.captureInsertionTarget() else {
+            if let lastExternalInsertionTarget {
+                Log.debug("[INSERT] reusing previous external target \(lastExternalInsertionTarget.summary)")
+            }
+            return lastExternalInsertionTarget
+        }
+
+        if captured.isCurrentApp {
+            if let lastExternalInsertionTarget {
+                Log.debug("[INSERT] captured GroqTalk; reusing previous external target \(lastExternalInsertionTarget.summary)")
+                return lastExternalInsertionTarget
+            }
+            Log.debug("[INSERT] captured GroqTalk and no previous external target is available")
+            return captured
+        }
+
+        lastExternalInsertionTarget = captured
+        return captured
     }
 
     // MARK: - TTS
     /// Shared tail for TTS tasks: drop back to idle + optionally refresh UI.
     @MainActor
     private func finishSpeech(refresh: Bool) {
-        if !TTSDialog.shared.isVisible {
-            appState = .idle; statusBar.setStopVisible(false)
-        }
+        appState = .idle
+        statusBar.setStopVisible(false)
         if refresh { statusBar.refreshHistory(); statusBar.refreshCost() }
     }
 
@@ -317,10 +522,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func beginSpeaking(requireIdle: Bool = false) -> Bool {
         if ttsEngine == .fast { ModelLifecycle.touchKokoro() }
+        ensureTTSAlignmentBackend()
+        stopAuxiliaryPlayback()
         ttsTask?.cancel(); player.stop()
         if requireIdle && appState != .idle { return false }
         appState = .speaking; statusBar.setStopVisible(true)
         return true
+    }
+
+    private func ensureTTSAlignmentBackend() {
+        guard let mode = TTSWordAlignmentService.preferredAlignmentMode(),
+              mode != .parakeet else { return }
+        startWhisperServer(mode)
+    }
+
+    private func stopAuxiliaryPlayback() {
+        previewVoiceName = nil
+        previewTask?.cancel()
+        clipTask?.cancel()
+        previewPlayer.stop()
+        clipPlayer.stop()
+    }
+
+    private func interruptSpeechForRecording() {
+        ttsTask?.cancel()
+        player.stop()
+        stopAuxiliaryPlayback()
+        TTSDialog.shared.setPaused(false)
+        appState = .idle
+        statusBar.setStopVisible(false)
+        NotificationHelper.clearStatus()
+        Log.info("[TTS] interrupted for recording")
+    }
+
+    private func closeSpeechWindow() {
+        ttsTask?.cancel()
+        player.stop()
+        stopAuxiliaryPlayback()
+        TTSDialog.shared.setPaused(false)
+        TTSDialog.shared.close()
+        appState = .idle
+        statusBar.setStopVisible(false)
+        NotificationHelper.clearStatus()
+        Log.info("[TTS] closed by toggle")
     }
 
     func jumpToChunk(_ index: Int) {
@@ -336,16 +580,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func jumpToWord(chunkIndex: Int, wordIndex: Int) {
+        Log.info("[TTS] jumpToWord chunk=\(chunkIndex) word=\(wordIndex)")
+        beginSpeaking()
+        ttsTask = Task { [weak self] in
+            guard let self else { return }
+            await SpeechService.resumeFromWord(
+                chunkIndex: chunkIndex,
+                wordIndex: wordIndex,
+                api: api,
+                player: player,
+                voice: currentVoice,
+                model: currentTTSModel,
+                rate: playbackRate,
+                usage: usage
+            )
+            await self.finishSpeech(refresh: false)
+        }
+    }
+
+    func toggleSpeakSelection() {
+        let dialogVisible = TTSDialog.shared.isVisible
+        Log.info("[TTS] toggleSpeakSelection (state=\(appState), dialog=\(dialogVisible))")
+        if dialogVisible || appState == .speaking {
+            closeSpeechWindow()
+            return
+        }
+        speakSelected()
+    }
+
     func speakSelected() {
         Log.info("[TTS] speakSelected invoked (state=\(appState))")
-        if appState == .speaking && player.paused {
-            player.togglePause(); TTSDialog.shared.setPaused(false)
-            statusBar.updateIcon(.speaking); Log.info("[TTS] resumed"); return
-        }
-        if appState == .speaking && !player.paused {
-            player.togglePause(); TTSDialog.shared.setPaused(true)
-            statusBar.updateIcon(.processing); Log.info("[TTS] paused"); return
-        }
         guard beginSpeaking(requireIdle: true) else { return }
         ttsTask = Task { [weak self] in
             guard let self else { return }
@@ -358,12 +623,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Replay
-    func replayRecording() {
-        guard let entry = history.load().last, let path = entry.ttsWavPath else { return }
-        replayEntry(path: path)
-    }
-
     func replayEntry(path: String) {
+        stopAuxiliaryPlayback()
         ttsTask?.cancel(); player.stop()
         appState = .speaking; statusBar.setStopVisible(true)
         ttsTask = Task { [weak self] in
@@ -389,6 +650,178 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func insertRecentText(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        _ = ClipboardService.insertText(trimmed, target: lastExternalInsertionTarget)
+    }
+
+    func toggleRecentTextPicker() {
+        if recentTextPicker.isVisible {
+            recentTextPicker.hide()
+            return
+        }
+        _ = captureInsertionTargetForNextAction()
+
+        let entries = HistoryManager.recentInsertableTextEntries(from: history.load(), limit: 5)
+        let items = entries.compactMap { entry -> RecentTextPickerItem? in
+            guard let text = HistoryManager.displayText(for: entry) else { return nil }
+            let title = String(text.prefix(120))
+            let subtitle = HistoryManager.relativeTime(entry.timestamp) + " · " + HistoryManager.timeString(from: entry.timestamp)
+            return RecentTextPickerItem(text: text, title: title, subtitle: subtitle)
+        }
+        guard !items.isEmpty else {
+            NotificationHelper.sendStatus("\u{274C} No recent text to insert yet")
+            return
+        }
+
+        recentTextPicker.show(items: items)
+        hotkeys.setTransientKeyHandler { [weak self] type, keyCode in
+            guard let self, self.recentTextPicker.isVisible else { return false }
+            return self.recentTextPicker.handleKey(type: type, keyCode: keyCode)
+        }
+    }
+
+    func openHistorySearch() {
+        historySearchPanel.show(entries: history.load())
+    }
+
+    func speakHistoryEntry(timestamp: String) {
+        guard let entry = history.load().first(where: { $0.timestamp == timestamp }) else { return }
+        let text = (entry.cleaned ?? entry.transcript ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        reuseText(text)
+    }
+
+    func editHistoryNote(timestamp: String) {
+        guard let entry = history.load().first(where: { $0.timestamp == timestamp }) else { return }
+        hotkeys.disableTap()
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "History Note"
+        alert.informativeText = "Add a note for this dictation entry. It will be searchable in the history panel."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        field.stringValue = entry.note ?? ""
+        field.placeholderString = "Example: client phrasing to reuse"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        let response = alert.runModal()
+        hotkeys.enableTap()
+        guard response == .alertFirstButtonReturn else { return }
+
+        history.updateNote(timestamp: timestamp, note: field.stringValue)
+        historySearchPanel.show(entries: history.load())
+        NotificationHelper.sendStatus("\u{2705} Note saved", subtitle: String(field.stringValue.prefix(60)))
+    }
+
+    func deleteLastDictationSentence() {
+        guard let instruction = DictationUndoManager.consumeDeleteInstruction() else {
+            NotificationHelper.sendStatus("\u{274C} Nothing to delete")
+            return
+        }
+        guard AccessibilityChecker.isTrusted() else {
+            NotificationHelper.sendStatus("\u{274C} Accessibility permission required")
+            return
+        }
+
+        ClipboardService.deleteBackward(count: instruction.count)
+        NotificationHelper.sendStatus("\u{2705} Deleted last sentence", subtitle: instruction.preview)
+    }
+
+    func playHistoryWord(timestamp: String, start: TimeInterval, end: TimeInterval) {
+        guard let entry = history.load().first(where: { $0.timestamp == timestamp }),
+              let path = entry.wavPath,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+
+        stopVoicePreview()
+        clipTask?.cancel()
+        clipPlayer.stop()
+        clipPlayer.reset()
+        ttsTask?.cancel()
+        player.stop()
+        appState = .speaking
+        statusBar.setStopVisible(true)
+
+        let leadIn = max(0, start - 0.12)
+        let leadOut = max(leadIn + 0.24, end + max(0.18, (end - start) * 1.4))
+        clipTask = Task { [weak self] in
+            guard let self else { return }
+            await clipPlayer.play(data: data, rate: 1.0, startAt: leadIn, endAt: leadOut)
+            await MainActor.run {
+                self.appState = .idle
+                self.statusBar.setStopVisible(false)
+            }
+        }
+    }
+
+    func previewVoice(_ voice: String) {
+        guard appState == .idle else { return }
+        if previewVoiceName == voice { return }
+        previewVoiceName = voice
+        previewTask?.cancel()
+        previewPlayer.stop()
+        previewPlayer.reset()
+        previewTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .milliseconds(140))
+            guard !Task.isCancelled else { return }
+
+            let cacheKey = "\(currentTTSModel)|\(voice)"
+            let data: Data
+            if let cached = previewCache[cacheKey] {
+                data = cached
+            } else {
+                do {
+                    data = try await api.speechData(
+                        text: "Hello, this is the \(voice) voice.",
+                        voice: voice,
+                        model: currentTTSModel
+                    )
+                    previewCache[cacheKey] = data
+                } catch {
+                    Log.info("[TTS] voice preview failed for \(voice): \(error.localizedDescription)")
+                    return
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            await previewPlayer.play(data: data, rate: 1.0)
+        }
+    }
+
+    func stopVoicePreview() {
+        previewVoiceName = nil
+        previewTask?.cancel()
+        previewPlayer.stop()
+    }
+
+    private func speakDialogChunk(index: Int, voice: String) {
+        guard let session = SpeechService.lastSession,
+              session.rawChunks.indices.contains(index) else { return }
+        beginSpeaking()
+        let text = session.rawChunks[index]
+        ttsTask = Task { [weak self] in
+            guard let self else { return }
+            await SpeechService.speakDirect(
+                text: text,
+                api: api,
+                player: player,
+                voice: voice,
+                model: currentTTSModel,
+                rate: playbackRate,
+                history: history,
+                usage: usage
+            )
+            await self.finishSpeech(refresh: true)
+        }
+    }
+
     // MARK: - Retry
     func retryPending(timestamp: String) {
         // Detached so stopAll() doesn't cancel it.
@@ -406,32 +839,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func exportSessionMarkdown() {
+        do {
+            let url = try history.exportSessionMarkdown(
+                since: sessionStartedAt,
+                activeDialogText: SpeechService.lastSession?.text
+            )
+            NotificationHelper.sendStatus("\u{2705} Session exported", subtitle: url.lastPathComponent)
+        } catch {
+            Log.error("[HISTORY] session export failed: \(error)")
+            NotificationHelper.sendStatus("\u{274C} Session export failed")
+        }
+    }
+
     // MARK: - Stop / Quit
     func stopAll() {
         sttTask?.cancel(); ttsTask?.cancel(); liveTask?.cancel()
+        stopAuxiliaryPlayback()
+        recentTextPicker.hide()
         player.stop()
         if appState == .recording { _ = recorder.stop() }
+        LiveCaptionPanel.shared.hide()
         appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[STOP] all stopped")
     }
 
-    /// SIGTERM then SIGKILL after 300ms — mlx_audio.server sometimes wedges
-    /// mid-model-load and won't honor SIGTERM. Hard-exit 1s later because
-    /// terminate(nil) can stall on any lingering window.
-    /// Pre-warm a specific STT mode by firing a silent 0.5s WAV at it. The
-    /// first inference call on a cold model is slow (Voxtral-3B takes ~10-30s
-    /// to load 8.7 GB of weights into MLX); this absorbs that delay at
-    /// menu-select time instead of at the user's first Fn press.
-    /// Fire-and-forget; logs outcome. Ignores errors.
+    /// Pre-warm a specific STT mode by firing a silent 0.5s WAV at it. This
+    /// keeps the first real dictation request from paying the model cold-load
+    /// penalty right after the user switches engines.
     func warmSTT(mode: ConfigManager.STTMode) {
-        let wav = Self.silentWAV(seconds: 0.5, sampleRate: ConfigManager.sampleRate)
-        let model = ConfigManager.sttModelID[mode] ?? ConfigManager.parakeetModel
+        let wav = AudioProcessor.silentWAV(seconds: 0.5)
+        guard ConfigManager.isSTTModeSelectable(mode) else {
+            Log.info("[STT] skip warm for \(mode.rawValue) — engine not available locally")
+            return
+        }
+        if mode != .parakeet { startWhisperServer(mode) }
         Log.info("[STT] warming \(mode.rawValue) — first request may take 10-30s if cold")
         Task.detached(priority: .utility) { [api] in
             let start = CFAbsoluteTimeGetCurrent()
             do {
-                _ = try await api.transcribeMLXAudio(wavData: wav, model: model)
+                if mode == .parakeet {
+                    _ = try await api.transcribeMLXAudio(wavData: wav, model: ConfigManager.parakeetModel)
+                } else {
+                    try? await Task.sleep(for: .milliseconds(800))
+                    _ = try await api.transcribeWhisperServer(
+                        wavData: wav,
+                        baseURL: ConfigManager.sttServerURL(for: mode)
+                    )
+                }
                 let elapsed = CFAbsoluteTimeGetCurrent() - start
                 Log.info("[STT] \(mode.rawValue) warmed in \(String(format: "%.1f", elapsed))s")
             } catch {
@@ -440,41 +896,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Generate a minimal PCM16 mono WAV of the given length filled with silence.
-    /// Used for STT warmups — the model still does a full forward pass, so the
-    /// cold-load happens, but the input is short to keep the warmup fast.
-    private static func silentWAV(seconds: Double, sampleRate: Int) -> Data {
-        let frames = Int(seconds * Double(sampleRate))
-        let dataBytes = frames * 2            // PCM16 mono
-        let byteRate  = sampleRate * 2
-        var header = Data(capacity: 44)
-        func u32(_ v: UInt32) {
-            header.append(UInt8(v & 0xFF))
-            header.append(UInt8((v >> 8) & 0xFF))
-            header.append(UInt8((v >> 16) & 0xFF))
-            header.append(UInt8((v >> 24) & 0xFF))
-        }
-        func u16(_ v: UInt16) {
-            header.append(UInt8(v & 0xFF))
-            header.append(UInt8((v >> 8) & 0xFF))
-        }
-        header.append(contentsOf: "RIFF".utf8); u32(UInt32(36 + dataBytes))
-        header.append(contentsOf: "WAVE".utf8)
-        header.append(contentsOf: "fmt ".utf8); u32(16); u16(1); u16(1)  // PCM, mono
-        u32(UInt32(sampleRate)); u32(UInt32(byteRate)); u16(2); u16(16)
-        header.append(contentsOf: "data".utf8); u32(UInt32(dataBytes))
-        return header + Data(count: dataBytes)
-    }
-
     func quit() {
         Log.info("[QUIT] user requested quit")
-        hotkeys.unregisterAll(); recorder.stop(); player.stop()
+        hotkeys.unregisterAll(); recorder.stop(); player.stop(); stopAuxiliaryPlayback()
+        recentTextPicker.hide()
+        LiveCaptionPanel.shared.hide()
         kokoroProcess?.terminate()
+        whisperSmallProcess?.terminate()
+        whisperLargeProcess?.terminate()
         let child = kokoroProcess
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
             if let p = child, p.isRunning { kill(p.processIdentifier, SIGKILL) }
             _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
                                  arguments: ["-9", "-f", "mlx_audio.server"])
+            _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"),
+                                 arguments: ["-9", "-f", "whisper-server"])
         }
         DispatchQueue.main.async {
             NSApplication.shared.terminate(nil)

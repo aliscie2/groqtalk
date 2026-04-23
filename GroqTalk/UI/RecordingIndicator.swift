@@ -2,10 +2,10 @@ import AppKit
 import QuartzCore
 
 /// Floating pill next to the cursor while the user is dictating.
-/// Contents: a red "REC" dot + 5 vertical bars that dance with the mic
-/// level in a VU-meter-like chase (the dot pulses at 1.5 Hz; the bars
-/// shift a level-history buffer so the rightmost bar shows "now" and
-/// earlier bars show recent past — looks alive even in silence).
+/// Contents: a red "REC" dot + a compact scrolling waveform made from a
+/// history strip of vertical bars. The rightmost bar shows "now" while the
+/// left edge trails the recent past, which makes the indicator read more like
+/// a waveform than a simple five-bar meter.
 ///
 /// Lives in a borderless, click-through NSPanel at .floating level.
 /// Follows the cursor at 60 Hz via NSEvent.mouseLocation.
@@ -16,11 +16,11 @@ final class RecordingIndicator {
 
     // Geometry
     private let dotSize: CGFloat   = 12
-    private let barCount: Int      = 5
-    private let barWidth: CGFloat  = 3
-    private let barGap: CGFloat    = 2
-    private let barMaxH: CGFloat   = 18
-    private let barMinH: CGFloat   = 3
+    private let barCount: Int      = 16
+    private let barWidth: CGFloat  = 2
+    private let barGap: CGFloat    = 1.5
+    private let barMaxH: CGFloat   = 20
+    private let barMinH: CGFloat   = 2
     private let padding: CGFloat   = 6
     private let panelH: CGFloat    = 28
     private let cursorOffset = NSPoint(x: 18, y: -26)   // up-and-right of cursor tip
@@ -128,7 +128,7 @@ final class RecordingIndicator {
         view.layer?.addSublayer(dot)
         dotLayer = dot
 
-        // Bars
+        // Waveform bars
         let barsStartX = dotX + dotSize + padding
         barLayers.removeAll(keepingCapacity: true)
         for i in 0..<barCount {
@@ -137,9 +137,8 @@ final class RecordingIndicator {
             b.anchorPoint = CGPoint(x: 0.5, y: 0.5)
             b.frame = CGRect(x: x, y: (panelH - barMinH) / 2, width: barWidth, height: barMinH)
             b.cornerRadius = barWidth / 2
-            // Gentle gradient from warm amber (newest) to dimmer red (oldest)
-            // purely via alpha — one color keeps the look coherent.
-            let alpha = 0.55 + 0.45 * Double(i) / Double(max(1, barCount - 1))
+            // Gentle brightness ramp so the right edge reads like the live head.
+            let alpha = 0.35 + 0.55 * Double(i) / Double(max(1, barCount - 1))
             b.backgroundColor = NSColor(red: 0.91, green: 0.70, blue: 0.41, alpha: alpha).cgColor
             view.layer?.addSublayer(b)
             barLayers.append(b)

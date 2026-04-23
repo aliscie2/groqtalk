@@ -20,9 +20,9 @@ mkdir -p build/GroqTalk.app/Contents/{MacOS,Resources}
 cp build/GroqTalk build/GroqTalk.app/Contents/MacOS/GroqTalk
 cp GroqTalk/Resources/Info.plist build/GroqTalk.app/Contents/Info.plist
 
-# Copy icon from Python project if available
-if [ -f /Users/ahmed/Desktop/groqtalk/icon.icns ]; then
-  cp /Users/ahmed/Desktop/groqtalk/icon.icns build/GroqTalk.app/Contents/Resources/AppIcon.icns
+# Copy the repo-local icon when available.
+if [ -f icon.icns ]; then
+  cp icon.icns build/GroqTalk.app/Contents/Resources/AppIcon.icns
 fi
 
 # Code-sign with a stable self-signed identity so macOS TCC (Accessibility,
