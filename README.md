@@ -7,7 +7,7 @@ Voice-to-text and text-to-speech menubar app for macOS. Local-only. Lives in you
 - **Speech-to-text** via selectable local engines:
   - Parakeet-TDT v2 (`mlx-community/parakeet-tdt-0.6b-v2`) for fast dictation
   - Whisper Large (`mlx-community/whisper-large-v3-turbo-asr-fp16`) as a second accuracy-oriented option
-- **Text-to-speech** via Kokoro (`mlx-community/Kokoro-82M-bf16`) with 9 preset voices.
+- **Text-to-speech** via Kokoro (`mlx-community/Kokoro-82M-bf16`) with 9 preset voices. Qwen3 CustomVoice is available as an explicit slow/experimental opt-in, but is hidden from the normal menu by default so it cannot steal resources from live dictation.
 - **Smart chunking** — Apple `NLTagger` sentence segmentation with an atomic-span mask so URLs, numbers, versions, quoted strings, parentheticals, code, and markdown emphasis never get cut mid-word.
 - **Live captions + pause-aware cleanup** — recording shows a floating caption panel and uses structured STT timing for cleaner punctuation/history.
 - **Searchable history** — search transcripts, add notes, replay entries, and click timed words to hear how you said them.
@@ -51,7 +51,7 @@ On first launch:
 2. **Grant Input Monitoring** (same pane) — this is a separate TCC service on macOS 10.15+; without it `tapCreate` succeeds but delivers zero events.
 3. **Grant Microphone** when prompted.
 
-First use will pull the Parakeet and Kokoro models from Hugging Face (~2.3 GB + ~160 MB). Subsequent runs load instantly.
+First use will pull the Parakeet and Kokoro models from Hugging Face (~2.3 GB + ~160 MB). Subsequent runs load instantly. The shared MLX audio server runs as one worker because GroqTalk serializes MLX inference for Metal stability; extra workers add CPU contention without improving this app's throughput.
 
 ### Hotkey troubleshooting
 

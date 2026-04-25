@@ -69,6 +69,8 @@ struct AudioProcessorWAVTests {
         expect(merged.prefix(4) == Data("RIFF".utf8), "Merged file should remain a RIFF/WAVE file")
         expect(readPCM16Samples(merged) == [1000, 2000, -1000, -2000, 3000, 4000],
                "Merged PCM samples should concatenate in order")
+        expect(abs((AudioProcessor.wavDuration(merged) ?? 0) - 0.000375) < 0.000001,
+               "Expected WAV duration to be derived from PCM frame count")
 
         let mismatched = makePCM16WAV(samples: [1, 2], sampleRate: 24_000)
         expect(AudioProcessor.concatenateWAVFiles([wavA, mismatched]) == nil,

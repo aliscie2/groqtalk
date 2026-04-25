@@ -15,6 +15,7 @@ final class AudioPlayer: @unchecked Sendable {
 
     /// Current playback position of the active chunk (seconds). 0 when idle.
     var currentTime: TimeInterval { audioPlayer?.currentTime ?? 0 }
+    var duration: TimeInterval { audioPlayer?.duration ?? 0 }
 
     func play(
         data: Data,

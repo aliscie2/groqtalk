@@ -92,20 +92,88 @@ struct ConfigManager {
 
     // MARK: - TTS
 
-    enum TTSEngine: String { case fast }
+    enum TTSEngine: String { case fast, qwen }
+    struct TTSDecodingOptions: Equatable {
+        let temperature: Double?
+        let topP: Double?
+        let topK: Int?
+        let repetitionPenalty: Double?
+    }
+    struct TTSChunkProfile: Equatable {
+        let mergeUpTo: Int
+        let maxChunk: Int
+    }
+    static let qwenCustomVoices = [
+        "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+        "Ryan", "Aiden", "Ono_Anna", "Sohee",
+    ]
     static let ttsEngines: [(engine: TTSEngine, label: String, model: String, voices: [String], defaultVoice: String)] = [
         // Kokoro-82M bf16 — consistent preset voices and already available
         // locally in this setup.
         (.fast, "Kokoro", "mlx-community/Kokoro-82M-bf16",
          ["af_heart", "af_bella", "af_nova", "af_sarah", "am_adam", "am_echo", "am_michael", "bf_emma", "bm_daniel"],
          "af_heart"),
+        // Qwen3-TTS 0.6B CustomVoice — officially supported by mlx-audio,
+        // stronger multilingual timbres, but heavier/slower than Kokoro.
+        (.qwen, "Qwen3 CustomVoice (Slow)", "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+         qwenCustomVoices,
+         "Ryan"),
     ]
     static let defaultTTSEngine: TTSEngine = .fast
+    static var availableTTSEngines: [(engine: TTSEngine, label: String, model: String, voices: [String], defaultVoice: String)] {
+        ttsEngines.filter { isTTSEngineSelectable($0.engine) }
+    }
     static func ttsEngineEntry(_ engine: TTSEngine) -> (label: String, model: String, voices: [String], defaultVoice: String) {
         let e = ttsEngines.first { $0.engine == engine } ?? ttsEngines[0]
         let voices = KokoroVoiceResolver.installedVoices(preferred: e.voices, model: e.model)
         let defaultVoice = voices.contains(e.defaultVoice) ? e.defaultVoice : (voices.first ?? e.defaultVoice)
         return (e.label, e.model, voices, defaultVoice)
+    }
+
+    static func ttsEngine(for model: String) -> TTSEngine? {
+        ttsEngines.first { $0.model == model }?.engine
+    }
+
+    static func ttsDecodingOptions(for engine: TTSEngine) -> TTSDecodingOptions {
+        switch engine {
+        case .fast:
+            return TTSDecodingOptions(
+                temperature: nil,
+                topP: nil,
+                topK: nil,
+                repetitionPenalty: nil
+            )
+        case .qwen:
+            // Qwen3-TTS defaults to stochastic decoding in mlx_audio.server.
+            // Pinning these values keeps the same preset voice stable across
+            // repeated requests and across chunked playback.
+            return TTSDecodingOptions(
+                temperature: 0.0,
+                topP: 1.0,
+                topK: 1,
+                repetitionPenalty: 1.0
+            )
+        }
+    }
+
+    static func ttsChunkProfile(for engine: TTSEngine) -> TTSChunkProfile {
+        switch engine {
+        case .fast:
+            return TTSChunkProfile(mergeUpTo: 120, maxChunk: 250)
+        case .qwen:
+            // Favor fewer, longer chunks for the premium engine so prosody
+            // and voice color stay more consistent across a read.
+            return TTSChunkProfile(mergeUpTo: 220, maxChunk: 420)
+        }
+    }
+
+    static func ttsFetchConcurrency(for engine: TTSEngine) -> Int {
+        switch engine {
+        case .fast:
+            return 3
+        case .qwen:
+            return 1
+        }
     }
 
     private static let selectedTTSEngineKey = "selectedTTSEngine"
@@ -115,7 +183,7 @@ struct ConfigManager {
                   let engine = TTSEngine(rawValue: raw) else {
                 return defaultTTSEngine
             }
-            return engine
+            return isTTSEngineSelectable(engine) ? engine : defaultTTSEngine
         }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: selectedTTSEngineKey) }
     }
@@ -135,6 +203,56 @@ struct ConfigManager {
         if let candidate, entry.voices.contains(candidate) { return candidate }
         return entry.defaultVoice
     }
+
+    static func isTTSEngineSelectable(_ engine: TTSEngine) -> Bool {
+        switch engine {
+        case .fast:
+            return true
+        case .qwen:
+            return slowQwenTTSEnabled
+                && isModelCached(ttsEngines.first { $0.engine == engine }?.model ?? "")
+        }
+    }
+
+    private static let slowQwenTTSEnabledKey = "enableSlowQwenTTS"
+    static var slowQwenTTSEnabled: Bool {
+        UserDefaults.standard.bool(forKey: slowQwenTTSEnabledKey)
+    }
+
+    private static func isModelCached(_ repoID: String) -> Bool {
+        guard !repoID.isEmpty else { return false }
+        let repoDir = huggingFaceHubRoot
+            .appendingPathComponent("hub", isDirectory: true)
+            .appendingPathComponent("models--" + repoID.replacingOccurrences(of: "/", with: "--"), isDirectory: true)
+
+        let refsMain = repoDir.appendingPathComponent("refs/main")
+        if let snapshot = try? String(contentsOf: refsMain, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !snapshot.isEmpty {
+            let snapshotDir = repoDir.appendingPathComponent("snapshots/\(snapshot)", isDirectory: true)
+            if FileManager.default.fileExists(atPath: snapshotDir.path) {
+                return true
+            }
+        }
+
+        let snapshotsDir = repoDir.appendingPathComponent("snapshots", isDirectory: true)
+        guard let contents = try? FileManager.default.contentsOfDirectory(at: snapshotsDir, includingPropertiesForKeys: nil),
+              !contents.isEmpty else {
+            return false
+        }
+        return contents.contains { url in
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+        }
+    }
+
+    private static var huggingFaceHubRoot: URL = {
+        if let hfHome = ProcessInfo.processInfo.environment["HF_HOME"], !hfHome.isEmpty {
+            return URL(fileURLWithPath: hfHome, isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".cache/huggingface", isDirectory: true)
+    }()
 
     private static let playbackRateKey = "playbackRate"
     static var playbackRate: Float {

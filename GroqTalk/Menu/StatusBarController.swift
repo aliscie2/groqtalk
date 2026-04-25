@@ -68,7 +68,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         add("STT Engine", submenu: sttSubmenu)
 
         ttsSubmenu = makeSubmenu()
-        for entry in ConfigManager.ttsEngines {
+        for entry in ConfigManager.availableTTSEngines {
             let mi = add(entry.label, action: #selector(handleSetTTSEngine(_:)), to: ttsSubmenu)
             mi.representedObject = entry.engine.rawValue
             mi.state = entry.engine == ConfigManager.selectedTTSEngine ? .on : .off
@@ -108,6 +108,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         for i in 0..<submenu.numberOfItems {
             if let item = submenu.item(at: i) { item.state = match(item) ? .on : .off }
         }
+    }
+
+    func refreshTTSSelection(engine: ConfigManager.TTSEngine) {
+        selectRadio(in: ttsSubmenu) { ($0.representedObject as? String) == engine.rawValue }
+        rebuildVoiceSubmenu(for: engine)
     }
 
     // MARK: - Icon & Controls
@@ -269,6 +274,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         rebuildVoiceSubmenu(for: engine)
         Log.info("[TTS] engine switched to \(entry.label) — model \(entry.model)")
         d.restartKokoroServer()
+        d.warmTTS(engine: engine, initialDelayMilliseconds: 1_200)
     }
 
     private func rebuildVoiceSubmenu(for engine: ConfigManager.TTSEngine) {

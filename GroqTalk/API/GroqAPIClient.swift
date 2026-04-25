@@ -81,7 +81,8 @@ final class GroqAPIClient: @unchecked Sendable {
         wavData: Data,
         language: String = "en",
         model: String = ConfigManager.parakeetModel,
-        verbose: Bool = true
+        verbose: Bool = true,
+        timeout: TimeInterval = 120
     ) async throws -> StructuredTranscript {
         let request = multipartRequest(
             url: URL(string: "\(ConfigManager.sttMLXAudioURL)/v1/audio/transcriptions")!,
@@ -91,7 +92,7 @@ final class GroqAPIClient: @unchecked Sendable {
             ("language", language),
             ("verbose", verbose ? "true" : "false"),
             ],
-            timeout: 120
+            timeout: timeout
         )
         let data = try await checkedData(for: request, logTag: "STT PARAKEET", errorPrefix: "Parakeet error")
         return StructuredTranscriptBuilder.fromNDJSON(data)
@@ -116,7 +117,8 @@ final class GroqAPIClient: @unchecked Sendable {
         wavData: Data,
         language: String = "en",
         baseURL: String,
-        verbose: Bool = true
+        verbose: Bool = true,
+        timeout: TimeInterval = 180
     ) async throws -> StructuredTranscript {
         var fields = [
             ("language", language),
@@ -131,13 +133,13 @@ final class GroqAPIClient: @unchecked Sendable {
             url: URL(string: "\(baseURL)/inference")!,
             wavData: wavData,
             fields: fields,
-            timeout: 180
+            timeout: timeout
         )
         let data = try await checkedData(for: request, logTag: "STT WHISPER", errorPrefix: "Whisper error")
         return StructuredTranscriptBuilder.fromNDJSON(data)
     }
 
-    // MARK: - Kokoro TTS via mlx_audio.server (port 8723)
+    // MARK: - Shared TTS via mlx_audio.server (port 8723)
 
     func speechData(text: String, voice: String, model: String) async throws -> Data {
         var request = URLRequest(url: URL(string: "\(ConfigManager.ttsBaseURL)/v1/audio/speech")!)
@@ -145,7 +147,8 @@ final class GroqAPIClient: @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 120
 
-        let fallbackVoice = ConfigManager.ttsEngineEntry(ConfigManager.selectedTTSEngine).defaultVoice
+        let engine = ConfigManager.ttsEngine(for: model) ?? ConfigManager.selectedTTSEngine
+        let fallbackVoice = ConfigManager.ttsEngineEntry(engine).defaultVoice
         let runtimeVoice = KokoroVoiceResolver.runtimeVoiceSpecifier(
             voice: voice,
             model: model,
@@ -155,12 +158,19 @@ final class GroqAPIClient: @unchecked Sendable {
             Log.info("[TTS API] resolved voice \(voice) locally")
         }
 
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "model": model,
             "input": text,
             "voice": runtimeVoice,
             "response_format": "wav"
         ]
+        let decoding = ConfigManager.ttsDecodingOptions(for: engine)
+        if let temperature = decoding.temperature { payload["temperature"] = temperature }
+        if let topP = decoding.topP { payload["top_p"] = topP }
+        if let topK = decoding.topK { payload["top_k"] = topK }
+        if let repetitionPenalty = decoding.repetitionPenalty {
+            payload["repetition_penalty"] = repetitionPenalty
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         return try await checkedData(for: request, logTag: "TTS API", errorPrefix: "TTS API error")
     }

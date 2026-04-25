@@ -8,6 +8,11 @@ enum TranscriptionService {
         rawText: String,
         cleanedText: String
     )
+    static var recoverSharedParakeetServer: (@Sendable (String) async -> Void)?
+
+    static func noteSharedParakeetServerRestarted() {
+        SharedSpeechServerHealth.noteRestart()
+    }
 
     static func process(
         buffers: [AVAudioPCMBuffer], api: GroqAPIClient,
@@ -114,37 +119,68 @@ enum TranscriptionService {
         recorder: AudioRecorder,
         api: GroqAPIClient,
         sttMode: ConfigManager.STTMode = .parakeet,
-        onPartial: ((String) -> Void)? = nil
+        sessionID: Int,
+        onPartial: ((LiveCaptionSnapshot) -> Void)? = nil
     ) async {
-        Log.info("[LIVE] live transcription started")
+        Log.info("[LIVE] session \(sessionID) started")
         var partsCollected = 0
-        var lastEmittedText = ""
-        let interval: UInt64 = 900_000_000
-        let rollingWindowSeconds = 2.4
+        var assembler = LiveTranscriptAssembler()
+        let interval: UInt64 = 400_000_000
+        let rollingWindowSeconds = 3.2
+        let requestTimeout = liveRequestTimeout(for: sttMode)
 
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: interval)
             guard !Task.isCancelled else { break }
+            guard recorder.isRecordingActive else {
+                Log.info("[LIVE] session \(sessionID) recorder inactive — exiting")
+                break
+            }
 
             let buffers = recorder.liveBuffers(maxDuration: rollingWindowSeconds)
             guard buffers.count >= 3 else { continue }
 
             let (wavData, duration) = AudioProcessor.prepareForWhisper(buffers)
-            guard duration >= 0.55 else { continue }
+            guard duration >= 0.45 else { continue }
 
             do {
-                let transcript = try await transcribe(mode: sttMode, wavData: wavData, api: api)
-                let cleanedText = TranscriptPostProcessor.clean(transcript)
-                guard !cleanedText.isEmpty else { continue }
-                guard cleanedText != lastEmittedText else { continue }
-                lastEmittedText = cleanedText
-                onPartial?(cleanedText)
+                let transcript = try await transcribe(
+                    mode: sttMode,
+                    wavData: wavData,
+                    api: api,
+                    requestTimeout: requestTimeout,
+                    phase: .livePartial
+                )
+                guard !Task.isCancelled, recorder.isRecordingActive else {
+                    Log.debug("[LIVE] session \(sessionID) cancelled before publish")
+                    break
+                }
+                guard let snapshot = assembler.consume(transcript) else { continue }
+                onPartial?(snapshot)
                 partsCollected += 1
+            } catch is CancellationError {
+                Log.debug("[LIVE] session \(sessionID) request cancelled")
+                break
             } catch {
-                Log.error("[LIVE] partial transcription error: \(error)")
+                let nsError = error as NSError
+                if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
+                    Log.debug("[LIVE] session \(sessionID) URLSession cancelled")
+                    break
+                }
+                if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorTimedOut {
+                    Log.info(
+                        "[LIVE] session \(sessionID) partial timed out after \(String(format: "%.1f", requestTimeout))s — skipping"
+                    )
+                    if sttMode == .parakeet,
+                       let reason = SharedSpeechServerHealth.recordTimeout(phase: .livePartial) {
+                        await recoverSharedParakeetServerIfNeeded(reason: reason, waitForRecovery: true)
+                    }
+                    continue
+                }
+                Log.error("[LIVE] session \(sessionID) partial transcription error: \(error)")
             }
         }
-        Log.info("[LIVE] thread stopped — \(partsCollected) parts collected")
+        Log.info("[LIVE] session \(sessionID) stopped — \(partsCollected) parts collected")
     }
 
     // MARK: - Helpers
@@ -193,7 +229,9 @@ enum TranscriptionService {
     private static func transcribe(
         mode: ConfigManager.STTMode,
         wavData: Data,
-        api: GroqAPIClient
+        api: GroqAPIClient,
+        requestTimeout: TimeInterval? = nil,
+        phase: SharedSpeechServerHealthState.Phase = .finalPass
     ) async throws -> StructuredTranscript {
         let start = CFAbsoluteTimeGetCurrent()
         let transcript: StructuredTranscript
@@ -202,16 +240,30 @@ enum TranscriptionService {
         case .parakeet:
             let model = ConfigManager.parakeetModel
             Log.info("[STT] sending to \(mode.rawValue) (\(ConfigManager.sttServerURL(for: mode)))...")
-            transcript = try await api.transcribeMLXAudioDetails(wavData: wavData, model: model, verbose: true)
+            transcript = try await api.transcribeMLXAudioDetails(
+                wavData: wavData,
+                model: model,
+                verbose: true,
+                timeout: requestTimeout ?? 120
+            )
         case .whisperSmall, .whisperLarge:
             let baseURL = ConfigManager.sttServerURL(for: mode)
             Log.info("[STT] sending to \(mode.rawValue) (\(baseURL))...")
-            transcript = try await api.transcribeWhisperServerDetails(wavData: wavData, baseURL: baseURL, verbose: true)
+            transcript = try await api.transcribeWhisperServerDetails(
+                wavData: wavData,
+                baseURL: baseURL,
+                verbose: true,
+                timeout: requestTimeout ?? 180
+            )
         }
 
         let trimmed = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
         Log.info("[STT] \(mode.rawValue) done in \(String(format: "%.2f", elapsed))s — \(trimmed.count) chars")
+        if mode == .parakeet,
+           let reason = SharedSpeechServerHealth.recordSuccess(duration: elapsed, phase: phase) {
+            await recoverSharedParakeetServerIfNeeded(reason: reason, waitForRecovery: false)
+        }
         return StructuredTranscript(text: trimmed, sentences: transcript.sentences)
     }
 
@@ -221,13 +273,14 @@ enum TranscriptionService {
         api: GroqAPIClient
     ) async throws -> StructuredTranscript {
         do {
-            return try await transcribe(mode: mode, wavData: wavData, api: api)
+            return try await transcribe(mode: mode, wavData: wavData, api: api, phase: .finalPass)
         } catch {
             guard mode == .parakeet, shouldRetrySharedServer(error) else { throw error }
-            Log.info("[STT] shared Parakeet server failed — waiting for auto-restart and retrying once")
+            let reason = sharedServerRecoveryReason(for: error)
+            Log.info("[STT] shared Parakeet server failed — recovering and retrying once")
             NotificationHelper.sendStatus("\u{231B} Restarting speech engine...")
-            try? await Task.sleep(for: .milliseconds(2400))
-            return try await transcribe(mode: mode, wavData: wavData, api: api)
+            await recoverSharedParakeetServerIfNeeded(reason: reason, waitForRecovery: true)
+            return try await transcribe(mode: mode, wavData: wavData, api: api, phase: .finalPass)
         }
     }
 
@@ -250,6 +303,41 @@ enum TranscriptionService {
         return message.contains("cannot parse response")
             || message.contains("could not connect")
             || message.contains("network connection was lost")
+    }
+
+    private static func liveRequestTimeout(for mode: ConfigManager.STTMode) -> TimeInterval {
+        switch mode {
+        case .parakeet:
+            return 1.5
+        case .whisperSmall:
+            return 4.0
+        case .whisperLarge:
+            return 6.0
+        }
+    }
+
+    private static func sharedServerRecoveryReason(for error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorTimedOut {
+            return SharedSpeechServerHealth.recordTimeout(phase: .finalPass)
+                ?? "shared 8723 server timed out during a final STT run"
+        }
+        return "shared 8723 server returned a retryable STT failure (\(nsError.localizedDescription))"
+    }
+
+    private static func recoverSharedParakeetServerIfNeeded(
+        reason: String,
+        waitForRecovery: Bool
+    ) async {
+        Log.info("[STT HEALTH] requesting shared server recovery: \(reason)")
+        guard let recoverSharedParakeetServer else { return }
+        if waitForRecovery {
+            await recoverSharedParakeetServer(reason)
+        } else {
+            Task.detached(priority: .utility) {
+                await recoverSharedParakeetServer(reason)
+            }
+        }
     }
 
     private static func maybeDenoise(_ wavDataRaw: Data) async -> Data {

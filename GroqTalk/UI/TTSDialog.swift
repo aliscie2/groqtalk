@@ -5,7 +5,7 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     static let shared = TTSDialog()
 
     var onChunkTap: ((Int) -> Void)?
-    var onWordTap: ((Int, Int) -> Void)?
+    var onWordTap: ((Int, Int, String?) -> Void)?
     var onClose: (() -> Void)?
     var onPauseToggle: (() -> Void)?
     var onRecordToggle: (() -> Void)?
@@ -353,8 +353,10 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
             "jumpWord": { [weak self] body in
                 if let index = body["index"] as? Int,
                    let wordIndex = body["wordIndex"] as? Int {
-                    Log.info("[DIALOG] JS jumpWord chunk=\(index) word=\(wordIndex)")
-                    self?.onWordTap?(index, wordIndex)
+                    let suffix = body["suffix"] as? String
+                    let preview = suffix.map { String($0.prefix(60)) } ?? ""
+                    Log.info("[DIALOG] JS jumpWord chunk=\(index) word=\(wordIndex) suffix=\(preview)")
+                    self?.onWordTap?(index, wordIndex, suffix)
                 }
             },
             "close": { [weak self] _ in
@@ -850,7 +852,11 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
           span.addEventListener('click',event=>{
             event.preventDefault();
             event.stopPropagation();
-            post('jumpWord',{index:chunkIndex,wordIndex:currentWord});
+            const range=document.createRange();
+            range.setStartBefore(span);
+            range.setEndAfter(root.lastChild);
+            const suffix=range.toString().replace(/\\s+/g,' ').trim();
+            post('jumpWord',{index:chunkIndex,wordIndex:currentWord,suffix});
           });
           fragment.appendChild(span);
         });

@@ -47,6 +47,22 @@ struct TimedWordMatcherTests {
             "Expected tracker to advance according to exact timings"
         )
 
+        expect(
+            tracker.playbackTime(forWordIndex: 2, duration: 1.0) == 0.35,
+            "Expected tracker to expose exact playback time for in-chunk seeking"
+        )
+
+        let estimatedTracker = LiveWordTracker(startWordIndex: 4, playableWordCount: 4, startTime: 0)
+        expect(
+            abs((estimatedTracker.playbackTime(forWordIndex: 6, duration: 8.0) ?? -1) - 4.0) < 0.001,
+            "Expected tracker to estimate a seek time before exact timings arrive"
+        )
+
+        expect(
+            estimatedTracker.playbackTime(forWordIndex: 9, duration: 8.0) == nil,
+            "Expected out-of-range word seeks to fail cleanly"
+        )
+
         print("TimedWordMatcher tests passed")
     }
 }

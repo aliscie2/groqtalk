@@ -4,6 +4,7 @@ struct HistoryEntry: Codable {
     let timestamp: String
     var wavPath: String? = nil
     var ttsWavPath: String? = nil
+    var ttsCacheKey: String? = nil
     var transcript: String? = nil
     var cleaned: String? = nil
     var structuredTranscript: StructuredTranscript? = nil
@@ -25,7 +26,7 @@ final class HistoryManager {
         structuredTranscript: StructuredTranscript? = nil
     ) {
         let ts = Self.timestamp()
-        let wavPath = dir + "/rec_\(ts).wav"
+        let wavPath = uniquePath(for: dir + "/rec_\(ts).wav")
         try? wavBytes.write(to: URL(fileURLWithPath: wavPath))
 
         var entries = load()
@@ -46,7 +47,7 @@ final class HistoryManager {
     /// Save recording immediately (before API call) — marked as pending
     func savePendingRecording(wavBytes: Data) -> String {
         let ts = Self.timestamp()
-        let wavPath = dir + "/rec_\(ts).wav"
+        let wavPath = uniquePath(for: dir + "/rec_\(ts).wav")
         try? wavBytes.write(to: URL(fileURLWithPath: wavPath))
 
         var entries = load()
@@ -83,30 +84,43 @@ final class HistoryManager {
         return try? Data(contentsOf: URL(fileURLWithPath: path))
     }
 
-    func saveTTSToHistory(text: String, ttsWavBytes: Data) {
+    func saveTTSToHistory(text: String, ttsWavBytes: Data, cacheKey: String) {
         let ts = Self.timestamp()
-        let ttsPath = dir + "/tts_\(ts).wav"
+        let ttsPath = uniquePath(for: dir + "/tts_\(ts).wav")
         try? ttsWavBytes.write(to: URL(fileURLWithPath: ttsPath))
 
         var entries = load()
-        // Try to attach to existing entry with matching text
-        if let idx = entries.lastIndex(where: { $0.cleaned == text || $0.transcript == text }) {
+        // Only reuse an existing entry if it doesn't already belong to a
+        // different engine/voice signature.
+        if let idx = entries.lastIndex(where: {
+            ($0.cleaned == text || $0.transcript == text)
+                && ($0.ttsWavPath == nil || $0.ttsCacheKey == cacheKey)
+        }) {
             entries[idx].ttsWavPath = ttsPath
+            entries[idx].ttsCacheKey = cacheKey
         } else {
-            entries.append(HistoryEntry(timestamp: ts, ttsWavPath: ttsPath, cleaned: text))
+            entries.append(HistoryEntry(timestamp: ts, ttsWavPath: ttsPath, ttsCacheKey: cacheKey, cleaned: text))
             Log.info("[HISTORY] saved standalone TTS \(ts) (\(ttsWavBytes.count) bytes)")
         }
         prune(&entries)
         save(entries)
     }
 
-    func findCachedTTS(text: String) -> Data? {
+    func findCachedTTS(text: String, cacheKey: String) -> Data? {
         let entries = load()
-        if let entry = entries.last(where: { ($0.cleaned == text || $0.transcript == text) && $0.ttsWavPath != nil }),
+        if let entry = entries.last(where: {
+            ($0.cleaned == text || $0.transcript == text)
+                && $0.ttsCacheKey == cacheKey
+                && $0.ttsWavPath != nil
+        }),
            let path = entry.ttsWavPath {
             return try? Data(contentsOf: URL(fileURLWithPath: path))
         }
         return nil
+    }
+
+    static func ttsCacheKey(model: String, voice: String) -> String {
+        "\(model)|\(voice)"
     }
 
     func updateNote(timestamp: String, note: String?) {
@@ -197,6 +211,24 @@ final class HistoryManager {
             let old = entries.removeFirst()
             if let p = old.wavPath { try? FileManager.default.removeItem(atPath: p); Log.debug("[HISTORY] deleted \(p)") }
             if let p = old.ttsWavPath { try? FileManager.default.removeItem(atPath: p) }
+        }
+    }
+
+    private func uniquePath(for suggestedPath: String) -> String {
+        guard FileManager.default.fileExists(atPath: suggestedPath) else { return suggestedPath }
+
+        let url = URL(fileURLWithPath: suggestedPath)
+        let ext = url.pathExtension
+        let base = ext.isEmpty ? suggestedPath : url.deletingPathExtension().path
+
+        var counter = 1
+        while true {
+            let candidateBase = "\(base)_\(counter)"
+            let candidate = ext.isEmpty ? candidateBase : "\(candidateBase).\(ext)"
+            if !FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+            counter += 1
         }
     }
 

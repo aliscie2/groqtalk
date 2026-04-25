@@ -2,13 +2,10 @@ import Foundation
 import NaturalLanguage
 
 enum TextChunker {
-    /// Target char range for a single TTS chunk. Short sentences are merged
-    /// upward while `len(buf) < mergeUpTo`; any single sentence longer than
-    /// `maxChunk` is soft-split at clause boundaries (see softSplit).
-    static let mergeUpTo = 120
-    static let maxChunk  = 250
-
-    static func split(_ text: String) -> [String] {
+    static func split(
+        _ text: String,
+        profile: ConfigManager.TTSChunkProfile = ConfigManager.ttsChunkProfile(for: .fast)
+    ) -> [String] {
         let blocks = extractBlocks(text)
         var chunks: [String] = []
         for block in blocks {
@@ -18,7 +15,7 @@ enum TextChunker {
             case .header, .listItem, .codeBlock:
                 chunks.append(block.text)
             case .prose:
-                chunks.append(contentsOf: splitProse(block.text))
+                chunks.append(contentsOf: splitProse(block.text, profile: profile))
             }
         }
         return chunks.filter { !$0.isEmpty }
@@ -211,12 +208,13 @@ enum TextChunker {
     /// Pipeline:
     ///   1. Sentence-split via NLTagger
     ///   2. Merge each sentence with the next if the running buffer is still
-    ///      under `mergeUpTo` and merged length stays under `maxChunk`
-    ///   3. If a single sentence is longer than `maxChunk`, soft-split it at
+    ///      under `profile.mergeUpTo` and merged length stays under
+    ///      `profile.maxChunk`
+    ///   3. If a single sentence is longer than `profile.maxChunk`, soft-split it at
     ///      clause boundaries that don't fall inside an atomic span (URLs,
     ///      quoted text, paired brackets, versions, decimals — found via
     ///      NSDataDetector + regex)
-    private static func splitProse(_ text: String) -> [String] {
+    private static func splitProse(_ text: String, profile: ConfigManager.TTSChunkProfile) -> [String] {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
 
         // Collapse internal newlines to spaces BEFORE sentence segmentation.
@@ -240,14 +238,14 @@ enum TextChunker {
             guard !sentence.isEmpty else { continue }
             if buf.isEmpty {
                 buf = sentence
-            } else if buf.count < mergeUpTo && buf.count + 1 + sentence.count <= maxChunk {
+            } else if buf.count < profile.mergeUpTo && buf.count + 1 + sentence.count <= profile.maxChunk {
                 buf += " " + sentence
             } else {
                 chunks.append(buf)
                 buf = sentence
             }
-            if buf.count > maxChunk {
-                chunks.append(contentsOf: softSplit(buf))
+            if buf.count > profile.maxChunk {
+                chunks.append(contentsOf: softSplit(buf, profile: profile))
                 buf = ""
             }
         }
@@ -353,14 +351,14 @@ enum TextChunker {
     /// Split a single over-long sentence at clause boundaries. Preference
     /// order: `;`/`:` → `",`/`")`/`"]` → ` — `/` -- ` → ` and/but/because…` →
     /// last space before 230. Never splits inside an atomic span.
-    private static func softSplit(_ sentence: String) -> [String] {
-        if sentence.count <= maxChunk { return [sentence] }
+    private static func softSplit(_ sentence: String, profile: ConfigManager.TTSChunkProfile) -> [String] {
+        if sentence.count <= profile.maxChunk { return [sentence] }
         var out: [String] = []
         var remaining = sentence
 
-        while remaining.count > maxChunk {
+        while remaining.count > profile.maxChunk {
             let nsRemaining = remaining as NSString
-            let windowEnd = min(maxChunk, nsRemaining.length)
+            let windowEnd = min(profile.maxChunk, nsRemaining.length)
             let window = nsRemaining.substring(to: windowEnd)
             let windowNS = window as NSString
             let atoms = atomicSpans(remaining)

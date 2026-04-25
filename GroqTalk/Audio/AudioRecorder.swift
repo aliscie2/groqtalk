@@ -13,6 +13,12 @@ final class AudioRecorder: @unchecked Sendable {
     /// Set on the main thread; do not reassign while recording is active.
     var onLevel: ((Float) -> Void)?
 
+    var isRecordingActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isRecording
+    }
+
     func start() throws {
         // Remove any leftover tap to avoid "tap already installed" crash
         if engine.isRunning {
@@ -85,6 +91,7 @@ final class AudioRecorder: @unchecked Sendable {
 
         lock.lock()
         let captured = buffers
+        buffers.removeAll()
         isRecording = false
         lock.unlock()
 

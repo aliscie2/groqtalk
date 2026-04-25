@@ -47,6 +47,26 @@ final class LiveWordTracker: @unchecked Sendable {
             startTime: startTime
         )
     }
+
+    func playbackTime(forWordIndex wordIndex: Int, duration: TimeInterval) -> TimeInterval? {
+        guard wordIndex >= startWordIndex,
+              wordIndex < startWordIndex + playableWordCount else {
+            return nil
+        }
+
+        lock.lock()
+        let words = exactWords
+        lock.unlock()
+
+        if let exact = words.first(where: { $0.wordIndex == wordIndex }) {
+            return max(0, exact.start)
+        }
+
+        let effectiveDuration = max(0.001, duration - startTime)
+        let relativeWord = max(0, wordIndex - startWordIndex)
+        let progress = min(max(Double(relativeWord) / Double(max(1, playableWordCount)), 0), 0.999_999)
+        return startTime + (progress * effectiveDuration)
+    }
 }
 
 enum TimedWordMatcher {

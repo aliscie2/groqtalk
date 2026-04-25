@@ -42,10 +42,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var liveTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var clipTask: Task<Void, Never>?
+    private var ttsJumpGeneration = 0
     private var previewCache: [String: Data] = [:]
     private var previewVoiceName: String?
     private var dictationInsertionTarget: ClipboardService.InsertionTarget?
     private var lastExternalInsertionTarget: ClipboardService.InsertionTarget?
+    private var liveSessionID = 0
+    private var sharedServerRecoveryInFlight = false
     private let sessionStartedAt = Date()
 
     // MARK: - Lifecycle
@@ -61,8 +64,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Feed mic RMS to the recording indicator so the VU-meter bars react.
         recorder.onLevel = { level in RecordingIndicator.shared.setLevel(level) }
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
-        TTSDialog.shared.onWordTap = { [weak self] chunkIndex, wordIndex in
-            self?.jumpToWord(chunkIndex: chunkIndex, wordIndex: wordIndex)
+        TTSDialog.shared.onWordTap = { [weak self] chunkIndex, wordIndex, suffix in
+            self?.jumpToWord(chunkIndex: chunkIndex, wordIndex: wordIndex, visibleSuffix: suffix)
         }
         TTSDialog.shared.voiceOptionsProvider = { [weak self] in
             guard let self else { return ([], "") }
@@ -97,26 +100,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recentTextPicker.onDismiss = { [weak self] in
             self?.hotkeys.setTransientKeyHandler(nil)
         }
+        TranscriptionService.recoverSharedParakeetServer = { [weak self] reason in
+            await self?.recoverSharedParakeetServer(reason: reason)
+        }
         ModelLifecycle.kokoroStart  = { [weak self] in self?.startKokoroServer() }
         ModelLifecycle.kokoroStop   = { [weak self] in self?.stopKokoroServer() }
         startKokoroServer()
         ModelLifecycle.markKokoroStarted()
         syncSelectedSTTServers()
+        // Warm the selected STT engine at launch so the first live partial
+        // doesn't pay the cold-load penalty or trip the shared-server watchdog.
+        warmSTT(mode: sttMode)
         // Parakeet rides on the shared mlx_audio server with Kokoro.
         // Whisper Small / Large use dedicated whisper-server daemons so they
         // do not destabilize the shared MLX TTS/STT runtime.
 
-        // Pre-warm Kokoro ~2s after launch so the first real TTS request
-        // doesn't pay cold-start cost (~0.5-1.2s on M5 Max per mlx-audio).
-        Task.detached(priority: .utility) { [api] in
-            try? await Task.sleep(for: .seconds(2))
-            _ = try? await api.speechData(
-                text: ".",
-                voice: ConfigManager.preferredVoice(for: ConfigManager.selectedTTSEngine),
-                model: ConfigManager.ttsEngineEntry(ConfigManager.selectedTTSEngine).model
-            )
-            Log.info("[TTS] pre-warm complete")
-        }
+        // Warm the selected TTS engine shortly after launch so the first read
+        // doesn't pay the full model download/load cost.
+        warmTTS(engine: ConfigManager.selectedTTSEngine, initialDelayMilliseconds: 2_000)
         Log.info("GroqTalk started — Fn (Record) | Fn+Ctrl (Recent Texts) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue) | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
     }
 
@@ -250,6 +251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // launchd strips PATH; the script needs /opt/homebrew visible.
                 var env = ProcessInfo.processInfo.environment
                 env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+                // The mlx_audio server defaults to multiple workers. GroqTalk
+                // serializes MLX inference for Metal stability, so one worker
+                // avoids extra CPU contention without reducing throughput.
+                env["MLX_AUDIO_NUM_WORKERS"] = "1"
+                env["TOKENIZERS_PARALLELISM"] = "false"
                 proc.environment = env
                 // mlx_audio.server writes logs/ in CWD; bundle CWD is EROFS.
                 proc.currentDirectoryURL = URL(fileURLWithPath: ConfigManager.configDir)
@@ -258,6 +264,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             getProcess: { [weak self] in self?.kokoroProcess },
             setProcess: { [weak self] p in self?.kokoroProcess = p }
         ))
+        if kokoroProcess != nil {
+            TranscriptionService.noteSharedParakeetServerRestarted()
+        }
     }
 
     /// Restart mlx_audio.server to evict cached models (RAM relief, 16 GB).
@@ -407,12 +416,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func stopLiveDictation() {
         guard appState == .recording else { return }
-        let liveDrainTask = liveTask
-        liveTask = nil
-        liveDrainTask?.cancel()
+        cancelLiveTranscription(reason: "stop live dictation")
         SoundCue.recordStop(); _ = recorder.stop()
         RecordingIndicator.shared.hide()
-        LiveCaptionPanel.shared.hide()
         appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[LIVE] dictation stopped")
@@ -441,12 +447,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func stopRecording() {
         guard appState == .recording else { return }
-        let liveDrainTask = liveTask
-        liveTask = nil
-        liveDrainTask?.cancel()
+        cancelLiveTranscription(reason: "stop recording")
         SoundCue.recordStop()
         RecordingIndicator.shared.hide()
-        LiveCaptionPanel.shared.hide()
         let buffers = recorder.stop()
         let insertionTarget = dictationInsertionTarget
         dictationInsertionTarget = nil
@@ -464,14 +467,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startLiveTranscription() {
+        let sessionID = beginLiveTranscriptionSession()
         liveTask = Task { [weak self] in
             guard let self else { return }
             await TranscriptionService.liveLoop(
                 recorder: recorder,
                 api: api,
-                sttMode: sttMode
-            ) { partial in
-                LiveCaptionPanel.shared.update(text: partial)
+                sttMode: sttMode,
+                sessionID: sessionID
+            ) { snapshot in
+                guard self.liveSessionID == sessionID, self.appState == .recording else {
+                    Log.debug("[LIVE] dropped stale snapshot from session \(sessionID)")
+                    return
+                }
+                LiveCaptionPanel.shared.update(snapshot: snapshot)
             }
         }
     }
@@ -485,6 +494,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LiveCaptionPanel.shared.show()
         NotificationHelper.sendStatus(status)
         startLiveTranscription()
+    }
+
+    private func beginLiveTranscriptionSession() -> Int {
+        if liveTask != nil {
+            cancelLiveTranscription(reason: "replace existing live session")
+        }
+        liveSessionID += 1
+        Log.info("[LIVE] session \(liveSessionID) registered")
+        return liveSessionID
+    }
+
+    private func cancelLiveTranscription(reason: String) {
+        let previousSession = liveSessionID
+        liveTask?.cancel()
+        liveTask = nil
+        liveSessionID += 1
+        LiveCaptionPanel.shared.hide()
+        Log.info("[LIVE] invalidated session \(previousSession) (\(reason))")
+    }
+
+    @MainActor
+    private func recoverSharedParakeetServer(reason: String) async {
+        guard !sharedServerRecoveryInFlight else {
+            Log.info("[STT HEALTH] recovery already in flight — \(reason)")
+            return
+        }
+
+        sharedServerRecoveryInFlight = true
+        defer { sharedServerRecoveryInFlight = false }
+
+        Log.info("[STT HEALTH] recovering shared 8723 server — \(reason)")
+        restartKokoroServer()
+        try? await Task.sleep(for: .milliseconds(600))
+        await warmParakeetAfterRecovery()
+        TranscriptionService.noteSharedParakeetServerRestarted()
+    }
+
+    private func warmParakeetAfterRecovery() async {
+        await warmSTTWithRetries(
+            mode: .parakeet,
+            logPrefix: "[STT HEALTH]",
+            initialDelayMilliseconds: 0
+        )
     }
 
     private func captureInsertionTargetForNextAction() -> ClipboardService.InsertionTarget? {
@@ -514,6 +566,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func finishSpeech(refresh: Bool) {
         appState = .idle
         statusBar.setStopVisible(false)
+        if ttsEngine == .qwen, sttMode == .parakeet {
+            warmSTT(mode: .parakeet)
+        }
         if refresh { statusBar.refreshHistory(); statusBar.refreshCost() }
     }
 
@@ -524,7 +579,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ttsEngine == .fast { ModelLifecycle.touchKokoro() }
         ensureTTSAlignmentBackend()
         stopAuxiliaryPlayback()
-        ttsTask?.cancel(); player.stop()
+        ttsTask?.cancel()
+        SpeechService.cancelOutstandingFetches(reason: "starting new TTS")
+        player.stop()
         if requireIdle && appState != .idle { return false }
         appState = .speaking; statusBar.setStopVisible(true)
         return true
@@ -545,18 +602,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func interruptSpeechForRecording() {
+        let wasQwen = ttsEngine == .qwen
+        invalidatePendingTTSJump()
         ttsTask?.cancel()
+        SpeechService.cancelOutstandingFetches(reason: "recording started")
         player.stop()
         stopAuxiliaryPlayback()
         TTSDialog.shared.setPaused(false)
         appState = .idle
         statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
+        if wasQwen {
+            fallBackToFastTTS(reason: "Qwen was interrupted for recording")
+            restartKokoroServer()
+            if sttMode == .parakeet { warmSTT(mode: .parakeet) }
+        }
         Log.info("[TTS] interrupted for recording")
     }
 
     private func closeSpeechWindow() {
+        let wasQwen = ttsEngine == .qwen
+        invalidatePendingTTSJump()
         ttsTask?.cancel()
+        SpeechService.cancelOutstandingFetches(reason: "TTS dialog closed")
         player.stop()
         stopAuxiliaryPlayback()
         TTSDialog.shared.setPaused(false)
@@ -564,38 +632,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState = .idle
         statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
+        if wasQwen {
+            fallBackToFastTTS(reason: "Qwen dialog was closed")
+            restartKokoroServer()
+            if sttMode == .parakeet { warmSTT(mode: .parakeet) }
+        }
         Log.info("[TTS] closed by toggle")
+    }
+
+    private func fallBackToFastTTS(reason: String) {
+        guard ttsEngine != .fast else { return }
+        ttsEngine = .fast
+        currentVoice = ConfigManager.preferredVoice(for: .fast)
+        statusBar.refreshTTSSelection(engine: .fast)
+        Log.info("[TTS] switched back to Kokoro — \(reason)")
     }
 
     func jumpToChunk(_ index: Int) {
         Log.info("[TTS] jumpToChunk \(index)")
-        beginSpeaking()
-        ttsTask = Task { [weak self] in
-            guard let self else { return }
-            await SpeechService.resumeFromChunk(
-                startAt: index, api: api, player: player, voice: currentVoice,
-                model: currentTTSModel, rate: playbackRate, usage: usage
-            )
-            await self.finishSpeech(refresh: false)
+        if SpeechService.seekToWordIfCurrentlyPlaying(dialogIndex: index, wordIndex: 0, player: player) {
+            return
+        }
+        let delayMS = SpeechService.hasCachedAudio(dialogIndex: index) ? 0 : nil
+        scheduleTTSJump(label: "chunk \(index)", delayOverrideMilliseconds: delayMS) { [weak self] in
+            guard let self else { return nil }
+            return Task { [weak self] in
+                guard let self else { return }
+                await SpeechService.resumeFromChunk(
+                    startAt: index, api: api, player: player, voice: currentVoice,
+                    model: currentTTSModel, rate: playbackRate, usage: usage
+                )
+                await self.finishSpeech(refresh: false)
+            }
         }
     }
 
-    func jumpToWord(chunkIndex: Int, wordIndex: Int) {
+    func jumpToWord(chunkIndex: Int, wordIndex: Int, visibleSuffix: String? = nil) {
         Log.info("[TTS] jumpToWord chunk=\(chunkIndex) word=\(wordIndex)")
-        beginSpeaking()
-        ttsTask = Task { [weak self] in
-            guard let self else { return }
-            await SpeechService.resumeFromWord(
-                chunkIndex: chunkIndex,
-                wordIndex: wordIndex,
-                api: api,
-                player: player,
-                voice: currentVoice,
-                model: currentTTSModel,
-                rate: playbackRate,
-                usage: usage
-            )
-            await self.finishSpeech(refresh: false)
+        if SpeechService.seekToWordIfCurrentlyPlaying(dialogIndex: chunkIndex, wordIndex: wordIndex, player: player) {
+            return
+        }
+        let delayMS = SpeechService.hasCachedAudio(dialogIndex: chunkIndex) ? 0 : nil
+        scheduleTTSJump(label: "word \(chunkIndex)/\(wordIndex)", delayOverrideMilliseconds: delayMS) { [weak self] in
+            guard let self else { return nil }
+            return Task { [weak self] in
+                guard let self else { return }
+                await SpeechService.resumeFromWord(
+                    chunkIndex: chunkIndex,
+                    wordIndex: wordIndex,
+                    api: api,
+                    player: player,
+                    voice: currentVoice,
+                    model: currentTTSModel,
+                    rate: playbackRate,
+                    usage: usage,
+                    firstChunkSuffixOverride: visibleSuffix
+                )
+                await self.finishSpeech(refresh: false)
+            }
+        }
+    }
+
+    private func invalidatePendingTTSJump() {
+        ttsJumpGeneration &+= 1
+    }
+
+    private func scheduleTTSJump(
+        label: String,
+        delayOverrideMilliseconds: Int? = nil,
+        makeTask: @escaping () -> Task<Void, Never>?
+    ) {
+        invalidatePendingTTSJump()
+        let generation = ttsJumpGeneration
+        ttsTask?.cancel()
+        player.stop()
+
+        let delayMS = delayOverrideMilliseconds ?? (ttsEngine == .qwen ? 450 : 90)
+        Log.debug("[TTS] scheduled \(label) jump in \(delayMS)ms")
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMS)) { [weak self] in
+            guard let self, self.ttsJumpGeneration == generation else { return }
+            _ = self.beginSpeaking()
+            self.ttsTask = makeTask()
         }
     }
 
@@ -611,6 +728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func speakSelected() {
         Log.info("[TTS] speakSelected invoked (state=\(appState))")
+        invalidatePendingTTSJump()
         guard beginSpeaking(requireIdle: true) else { return }
         ttsTask = Task { [weak self] in
             guard let self else { return }
@@ -624,6 +742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Replay
     func replayEntry(path: String) {
+        invalidatePendingTTSJump()
         stopAuxiliaryPlayback()
         ttsTask?.cancel(); player.stop()
         appState = .speaking; statusBar.setStopVisible(true)
@@ -639,6 +758,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func reuseText(_ text: String) {
+        invalidatePendingTTSJump()
         beginSpeaking()
         ttsTask = Task { [weak self] in
             guard let self else { return }
@@ -869,30 +989,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// keeps the first real dictation request from paying the model cold-load
     /// penalty right after the user switches engines.
     func warmSTT(mode: ConfigManager.STTMode) {
-        let wav = AudioProcessor.silentWAV(seconds: 0.5)
         guard ConfigManager.isSTTModeSelectable(mode) else {
             Log.info("[STT] skip warm for \(mode.rawValue) — engine not available locally")
             return
         }
         if mode != .parakeet { startWhisperServer(mode) }
         Log.info("[STT] warming \(mode.rawValue) — first request may take 10-30s if cold")
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.warmSTTWithRetries(
+                mode: mode,
+                logPrefix: "[STT]",
+                initialDelayMilliseconds: mode == .parakeet ? 600 : 800
+            )
+        }
+    }
+
+    func warmTTS(engine: ConfigManager.TTSEngine, initialDelayMilliseconds: Int = 0) {
+        guard ConfigManager.isTTSEngineSelectable(engine) else {
+            Log.info("[TTS] skip warm for \(engine.rawValue) — engine not available locally")
+            return
+        }
+        guard engine == .fast else {
+            Log.info("[TTS] skip warm for \(engine.rawValue) — premium TTS shares the Parakeet server and loads on first use")
+            return
+        }
+        let entry = ConfigManager.ttsEngineEntry(engine)
+        let voice = ConfigManager.preferredVoice(for: engine)
+        Log.info("[TTS] warming \(entry.label) — first request may download/load the model if cold")
         Task.detached(priority: .utility) { [api] in
+            if initialDelayMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(initialDelayMilliseconds))
+            }
+
             let start = CFAbsoluteTimeGetCurrent()
             do {
-                if mode == .parakeet {
-                    _ = try await api.transcribeMLXAudio(wavData: wav, model: ConfigManager.parakeetModel)
-                } else {
-                    try? await Task.sleep(for: .milliseconds(800))
-                    _ = try await api.transcribeWhisperServer(
-                        wavData: wav,
-                        baseURL: ConfigManager.sttServerURL(for: mode)
-                    )
-                }
+                _ = try await api.speechData(
+                    text: ".",
+                    voice: voice,
+                    model: entry.model
+                )
                 let elapsed = CFAbsoluteTimeGetCurrent() - start
-                Log.info("[STT] \(mode.rawValue) warmed in \(String(format: "%.1f", elapsed))s")
+                Log.info("[TTS] \(entry.label) warmed in \(String(format: "%.1f", elapsed))s")
             } catch {
-                Log.info("[STT] \(mode.rawValue) warm failed: \(error.localizedDescription)")
+                Log.info("[TTS] \(entry.label) warm failed: \(error.localizedDescription)")
             }
+        }
+    }
+
+    private func warmSTTWithRetries(
+        mode: ConfigManager.STTMode,
+        logPrefix: String,
+        initialDelayMilliseconds: Int,
+        maxAttempts: Int = 4
+    ) async {
+        let wav = AudioProcessor.silentWAV(seconds: 0.5)
+        let start = CFAbsoluteTimeGetCurrent()
+
+        if initialDelayMilliseconds > 0 {
+            try? await Task.sleep(for: .milliseconds(initialDelayMilliseconds))
+        }
+
+        for attempt in 1...maxAttempts {
+            do {
+                try await performWarmSTTRequest(mode: mode, wav: wav)
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                let label = mode == .parakeet && logPrefix == "[STT HEALTH]"
+                    ? "parakeet warmed after recovery"
+                    : "\(mode.rawValue) warmed"
+                Log.info("\(logPrefix) \(label) in \(String(format: "%.1f", elapsed))s")
+                return
+            } catch {
+                guard attempt < maxAttempts, shouldRetryWarmSTT(error) else {
+                    let label = mode == .parakeet && logPrefix == "[STT HEALTH]"
+                        ? "parakeet warm after recovery failed"
+                        : "\(mode.rawValue) warm failed"
+                    Log.info("\(logPrefix) \(label): \(error.localizedDescription)")
+                    return
+                }
+
+                Log.info(
+                    "\(logPrefix) \(mode.rawValue) warm attempt \(attempt) failed: \(error.localizedDescription) — retrying"
+                )
+                let retryDelay = UInt64(400 * attempt)
+                try? await Task.sleep(for: .milliseconds(Int(retryDelay)))
+            }
+        }
+    }
+
+    private func performWarmSTTRequest(mode: ConfigManager.STTMode, wav: Data) async throws {
+        if mode == .parakeet {
+            _ = try await api.transcribeMLXAudio(
+                wavData: wav,
+                model: ConfigManager.parakeetModel
+            )
+            return
+        }
+
+        _ = try await api.transcribeWhisperServer(
+            wavData: wav,
+            baseURL: ConfigManager.sttServerURL(for: mode)
+        )
+    }
+
+    private func shouldRetryWarmSTT(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else { return false }
+        switch nsError.code {
+        case NSURLErrorCannotConnectToHost,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorTimedOut,
+             NSURLErrorCannotFindHost:
+            return true
+        default:
+            return false
         }
     }
 

@@ -60,8 +60,9 @@ if [ -x "$HOME/.config/groqtalk/start_tts.sh" ]; then
   "$HOME/.config/groqtalk/start_tts.sh" > "$TMP/server.log" 2>&1 &
 else
   PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    MLX_AUDIO_NUM_WORKERS=1 TOKENIZERS_PARALLELISM=false \
     /opt/homebrew/bin/python3.11 -m mlx_audio.server \
-    --host 127.0.0.1 --port "$PORT" > "$TMP/server.log" 2>&1 &
+    --host 127.0.0.1 --port "$PORT" --workers 1 > "$TMP/server.log" 2>&1 &
 fi
 SERVER=$!
 trap "kill $SERVER 2>/dev/null; rm -rf $TMP" EXIT

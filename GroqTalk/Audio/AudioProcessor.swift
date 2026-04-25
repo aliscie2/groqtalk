@@ -83,6 +83,16 @@ enum AudioProcessor {
         )
     }
 
+    static func wavDuration(_ wavData: Data) -> TimeInterval? {
+        guard let descriptor = parseWAV(wavData),
+              descriptor.sampleRate > 0,
+              descriptor.blockAlign > 0 else {
+            return nil
+        }
+        let frameCount = Double(descriptor.pcmData.count) / Double(descriptor.blockAlign)
+        return frameCount / Double(descriptor.sampleRate)
+    }
+
     static func prepareForWhisper(_ buffers: [AVAudioPCMBuffer]) -> (Data, Double) {
         let start = CFAbsoluteTimeGetCurrent()
         let raw = concatenate(buffers)
