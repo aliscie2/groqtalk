@@ -46,7 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewCache: [String: Data] = [:]
     private var previewVoiceName: String?
     private var dictationInsertionTarget: ClipboardService.InsertionTarget?
+    private var dictationUsesDialog = false
     private var lastExternalInsertionTarget: ClipboardService.InsertionTarget?
+    /// Set while the TTS dialog is in `.sttEdit` mode awaiting user confirm.
+    /// When non-nil, Fn means "submit the edit and insert into this target".
+    private var dictationEditingTarget: ClipboardService.InsertionTarget?
     private var liveSessionID = 0
     private var sharedServerRecoveryInFlight = false
     private let sessionStartedAt = Date()
@@ -61,8 +65,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // monitor surfaces a lock icon so the cause is visible in under a sec.
         SecureInputMonitor.shared.start { [weak self] in self?.statusBar.setSecureInputWarning($0) }
         SoundCue.prepare()
-        // Feed mic RMS to the recording indicator so the VU-meter bars react.
-        recorder.onLevel = { level in RecordingIndicator.shared.setLevel(level) }
+        // Feed mic RMS to recording surfaces so they react to voice energy.
+        recorder.onLevel = { level in
+            RecordingIndicator.shared.setLevel(level)
+            MinimalDictationOverlay.shared.setLevel(level)
+        }
         TTSDialog.shared.onChunkTap = { [weak self] idx in self?.jumpToChunk(idx) }
         TTSDialog.shared.onWordTap = { [weak self] chunkIndex, wordIndex, suffix in
             self?.jumpToWord(chunkIndex: chunkIndex, wordIndex: wordIndex, visibleSuffix: suffix)
@@ -80,10 +87,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             TTSDialog.shared.setPaused(self.player.paused)
         }
         TTSDialog.shared.onRecordToggle = { [weak self] in
-            self?.toggleRecording()
+            self?.toggleRecording(showDialog: true)
         }
         TTSDialog.shared.onClose = { [weak self] in
-            self?.closeSpeechWindow()
+            self?.handleDialogClose()
+        }
+        TTSDialog.shared.onSubmit = { [weak self] in
+            self?.submitDictationEdit()
+        }
+        TTSDialog.shared.onCancel = { [weak self] in
+            self?.cancelDictationEdit()
         }
         historySearchPanel.onSpeakEntry = { [weak self] timestamp in
             self?.speakHistoryEntry(timestamp: timestamp)
@@ -96,6 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         recentTextPicker.onSelect = { [weak self] text in
             self?.insertRecentText(text)
+        }
+        recentTextPicker.onOpenInDialog = { [weak self] text in
+            self?.openTextInEditDialog(text)
         }
         recentTextPicker.onDismiss = { [weak self] in
             self?.hotkeys.setTransientKeyHandler(nil)
@@ -118,7 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Warm the selected TTS engine shortly after launch so the first read
         // doesn't pay the full model download/load cost.
         warmTTS(engine: ConfigManager.selectedTTSEngine, initialDelayMilliseconds: 2_000)
-        Log.info("GroqTalk started — Fn (Record) | Fn+Ctrl (Recent Texts) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue) | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
+        Log.info("GroqTalk started — Fn (Record + Insert) | Shift+Fn (Record + Dialog) | Fn+Ctrl (Recent Texts) | Ctrl+Option (Speak) | RAM: \(ConfigManager.systemRAMGB)GB | STT: \(sttMode.rawValue) | idleUnload: \(ConfigManager.idleUnloadSeconds)s")
     }
 
     // MARK: - Server spawn (table-driven)
@@ -391,7 +407,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupHotkeys() {
         hotkeys.install()
         hotkeys.installModifierHotkeys(
-            fnAction: { [weak self] in self?.toggleRecording() },
+            fnAction: { [weak self] in self?.toggleRecording(showDialog: false) },
+            fnShiftAction: { [weak self] in self?.toggleRecording(showDialog: true) },
             fnCtrlAction: { [weak self] in self?.toggleRecentTextPicker() },
             ctrlOptAction: { [weak self] in self?.toggleSpeakSelection() }
         )
@@ -408,7 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startLiveDictation() {
         guard appState == .idle else { return }
         do {
-            try beginCapture(status: "\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop")
+            try beginCapture(status: "\u{1F3A4} Live dictation... Press Cmd+Shift+Space to stop", showDialog: true)
         } catch {
             Log.error("[LIVE] failed to start: \(error)"); appState = .idle
         }
@@ -419,28 +436,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancelLiveTranscription(reason: "stop live dictation")
         SoundCue.recordStop(); _ = recorder.stop()
         RecordingIndicator.shared.hide()
+        MinimalDictationOverlay.shared.hide()
+        TTSDialog.shared.close()
         appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[LIVE] dictation stopped")
     }
 
     // MARK: - Recording (STT)
-    func toggleRecording() {
+    func toggleRecording(showDialog: Bool = false) {
+        // When the dialog is awaiting an STT edit confirmation, Fn submits the
+        // edit instead of starting a new recording.
+        if dictationEditingTarget != nil {
+            submitDictationEdit()
+            return
+        }
         if appState == .recording { stopRecording() }
         else if appState == .speaking {
             interruptSpeechForRecording()
-            startRecording()
+            startRecording(showDialog: showDialog)
         }
-        else if appState == .idle { startRecording() }
+        else if appState == .idle { startRecording(showDialog: showDialog) }
     }
 
-    func startRecording() {
+    func startRecording(showDialog: Bool = false) {
         guard appState == .idle else { return }
+        dictationUsesDialog = showDialog
+        Log.info("[REC] start requested (\(showDialog ? "dialog" : "direct") mode)")
         dictationInsertionTarget = captureInsertionTargetForNextAction()
         do {
-            try beginCapture(status: "\u{1F534} Recording... Press Fn to stop")
+            let stopHint = showDialog ? "Shift+Fn" : "Fn"
+            try beginCapture(status: "\u{1F534} Recording... Press \(stopHint) to stop", showDialog: showDialog)
         } catch {
             dictationInsertionTarget = nil
+            dictationUsesDialog = false
             Log.error("[REC] failed: \(error)"); appState = .idle
         }
     }
@@ -450,23 +479,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancelLiveTranscription(reason: "stop recording")
         SoundCue.recordStop()
         RecordingIndicator.shared.hide()
+        MinimalDictationOverlay.shared.hide()
         let buffers = recorder.stop()
         let insertionTarget = dictationInsertionTarget
+        let shouldShowDialog = dictationUsesDialog
+        Log.info("[REC] stop requested (\(shouldShowDialog ? "dialog" : "direct") mode)")
         dictationInsertionTarget = nil
+        dictationUsesDialog = false
         appState = .processing; statusBar.setStopVisible(true)
         sttTask = Task { [weak self] in
             guard let self else { return }
-            await TranscriptionService.process(
+            let cleaned = await TranscriptionService.process(
                 buffers: buffers, api: api,
                 history: history, usage: usage,
                 sttMode: sttMode,
-                insertionTarget: insertionTarget
+                insertionTarget: insertionTarget,
+                autoInsert: !shouldShowDialog
             )
+            if shouldShowDialog {
+                await MainActor.run {
+                    if let cleaned, !cleaned.isEmpty {
+                        self.dictationEditingTarget = insertionTarget
+                        TTSDialog.shared.setEditMode(text: cleaned)
+                    } else {
+                        TTSDialog.shared.close()
+                    }
+                }
+            }
             await self.finishSpeech(refresh: true)
         }
     }
 
-    private func startLiveTranscription() {
+    /// User confirmed an edit (Fn / ⌘⏎ / Insert button). Read the edited text
+    /// out of the webview, paste it into the captured target, dismiss dialog.
+    func submitDictationEdit() {
+        guard let target = dictationEditingTarget else { return }
+        dictationEditingTarget = nil
+        Task {
+            let edited = await TTSDialog.shared.currentEditedText()
+            await MainActor.run {
+                TTSDialog.shared.close()
+                let trimmed = edited.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    Log.info("[STT] submit ignored — edited text empty")
+                    return
+                }
+                // The dialog promoted GroqTalk to .regular and was the key window.
+                // Drop back to menu-bar-only and yield key status before pasting,
+                // otherwise the target app's activate() races with us and the
+                // keystrokes land in GroqTalk instead of the user's input.
+                NSApp.deactivate()
+                _ = NSApp.setActivationPolicy(.prohibited)
+                DictationUndoManager.recordPastedText(trimmed)
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
+                    _ = ClipboardService.insertText(trimmed, target: target)
+                }
+            }
+        }
+    }
+
+    /// User dismissed the editable dialog (Esc / close button) — drop the edit.
+    func cancelDictationEdit() {
+        dictationEditingTarget = nil
+        TTSDialog.shared.close()
+        Log.info("[STT] edit cancelled")
+    }
+
+    /// Title-bar close routes by mode: STT edit cancels the edit, an active
+    /// recording stops cleanly (which then surfaces the edit dialog), TTS
+    /// playback closes the speech window the same as before.
+    private func handleDialogClose() {
+        if dictationEditingTarget != nil {
+            cancelDictationEdit()
+            return
+        }
+        if appState == .recording {
+            stopRecording()
+            return
+        }
+        closeSpeechWindow()
+    }
+
+    private func startLiveTranscription(showDialog: Bool) {
         let sessionID = beginLiveTranscriptionSession()
         liveTask = Task { [weak self] in
             guard let self else { return }
@@ -480,20 +574,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     Log.debug("[LIVE] dropped stale snapshot from session \(sessionID)")
                     return
                 }
-                LiveCaptionPanel.shared.update(snapshot: snapshot)
+                let combined = [snapshot.committedText, snapshot.tentativeText]
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " ")
+                DispatchQueue.main.async {
+                    if showDialog {
+                        TTSDialog.shared.updateLive(text: combined)
+                    } else {
+                        MinimalDictationOverlay.shared.update(snapshot: snapshot)
+                    }
+                }
             }
         }
     }
 
-    private func beginCapture(status: String) throws {
+    private func beginCapture(status: String, showDialog: Bool) throws {
         stopAuxiliaryPlayback()
         try recorder.start()
         SoundCue.recordStart()
         appState = .recording
-        RecordingIndicator.shared.show()
-        LiveCaptionPanel.shared.show()
+        if showDialog {
+            RecordingIndicator.shared.show()
+            MinimalDictationOverlay.shared.hide()
+            TTSDialog.shared.showLive()
+            startLiveTranscription(showDialog: true)
+        } else {
+            RecordingIndicator.shared.hide()
+            TTSDialog.shared.close()
+            MinimalDictationOverlay.shared.show()
+            startLiveTranscription(showDialog: false)
+        }
         NotificationHelper.sendStatus(status)
-        startLiveTranscription()
     }
 
     private func beginLiveTranscriptionSession() -> Int {
@@ -510,7 +622,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         liveTask?.cancel()
         liveTask = nil
         liveSessionID += 1
-        LiveCaptionPanel.shared.hide()
         Log.info("[LIVE] invalidated session \(previousSession) (\(reason))")
     }
 
@@ -796,10 +907,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         recentTextPicker.show(items: items)
-        hotkeys.setTransientKeyHandler { [weak self] type, keyCode in
+        hotkeys.setTransientKeyHandler { [weak self] type, keyCode, flags in
             guard let self, self.recentTextPicker.isVisible else { return false }
-            return self.recentTextPicker.handleKey(type: type, keyCode: keyCode)
+            let shift = flags.contains(.maskShift)
+            return self.recentTextPicker.handleKey(type: type, keyCode: keyCode, shift: shift)
         }
+    }
+
+    /// Open a recalled text in the editable TTS dialog. The previously
+    /// captured external target is reused so that submit/Fn pastes back into
+    /// the user's original input field.
+    func openTextInEditDialog(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let target = lastExternalInsertionTarget else {
+            // No remembered target — fall back to a direct paste.
+            insertRecentText(trimmed)
+            return
+        }
+        dictationEditingTarget = target
+        TTSDialog.shared.setEditMode(text: trimmed)
     }
 
     func openHistorySearch() {
@@ -979,7 +1106,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recentTextPicker.hide()
         player.stop()
         if appState == .recording { _ = recorder.stop() }
-        LiveCaptionPanel.shared.hide()
+        dictationUsesDialog = false
+        dictationEditingTarget = nil
+        MinimalDictationOverlay.shared.hide()
+        TTSDialog.shared.close()
         appState = .idle; statusBar.setStopVisible(false)
         NotificationHelper.clearStatus()
         Log.info("[STOP] all stopped")
@@ -1109,7 +1239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.info("[QUIT] user requested quit")
         hotkeys.unregisterAll(); recorder.stop(); player.stop(); stopAuxiliaryPlayback()
         recentTextPicker.hide()
-        LiveCaptionPanel.shared.hide()
+        MinimalDictationOverlay.shared.hide()
+        TTSDialog.shared.close()
         kokoroProcess?.terminate()
         whisperSmallProcess?.terminate()
         whisperLargeProcess?.terminate()

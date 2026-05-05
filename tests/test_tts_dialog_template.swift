@@ -25,6 +25,18 @@ struct TTSDialogTemplateTests {
             "Pipe styling should also stay limited to compact token rows"
         )
         expect(
+            !source.contains("replace(/^\\\\d{1,3}[\\\\.\\\\)]\\\\s+/,"),
+            "Ordered-list markers should stay visible so the TTS dialog matches the original document"
+        )
+        expect(
+            source.contains(".chunk.list-item .chunk-body{padding-left:1.25em;text-indent:-1.25em}"),
+            "List chunks should keep original markers with a compact hanging indent"
+        )
+        expect(
+            source.contains("if(/^[-*]\\\\s+/.test(trimmed))return '<span class=\"list-bullet\">"),
+            "Unordered list chunks should render as real bullets instead of oversized cards"
+        )
+        expect(
             source.contains("function highlightWord(chunkIndex,wordIndex){"),
             "Dialog should expose a word highlight function for live speech tracking"
         )

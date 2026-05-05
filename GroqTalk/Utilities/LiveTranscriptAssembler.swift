@@ -21,7 +21,7 @@ struct LiveTranscriptAssembler {
     init(
         unstableTailSeconds: TimeInterval = 0.95,
         fallbackTentativeWordCount: Int = 3,
-        contextWordLimit: Int = 18
+        contextWordLimit: Int = 4000
     ) {
         self.unstableTailSeconds = unstableTailSeconds
         self.fallbackTentativeWordCount = fallbackTentativeWordCount

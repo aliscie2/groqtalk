@@ -1,6 +1,12 @@
 import AppKit
 import WebKit
 
+enum DialogMode: String {
+    case tts                          // TTS playback: read-only, click-to-jump, voice menu
+    case sttLive = "stt-live"         // STT live transcription: re-rendered each partial
+    case sttEdit = "stt-edit"         // STT post-record / recalled text: editable, submit-to-insert
+}
+
 final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     static let shared = TTSDialog()
 
@@ -11,7 +17,12 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     var onRecordToggle: (() -> Void)?
     var onChunkVoiceSelect: ((Int, String) -> Void)?
     var voiceOptionsProvider: (() -> (voices: [String], current: String))?
+    /// Fired when the user confirms an STT-mode edit (Fn / ⏎ / Insert button).
+    var onSubmit: (() -> Void)?
+    /// Fired when the user dismisses an STT-mode edit (Esc).
+    var onCancel: (() -> Void)?
 
+    private(set) var mode: DialogMode = .tts
     private var window: NSWindow?
     private var webView: WKWebView?
     private var currentPayload: DialogPayload?
@@ -35,7 +46,64 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     func show(text: String, chunks: [String], playbackRate: Float) {
         Log.info("[DIALOG] show (\(text.count) chars, \(chunks.count) chunks)")
         DispatchQueue.main.async { [weak self] in
+            self?.mode = .tts
             self?.showOnMain(text: text, chunks: chunks, playbackRate: playbackRate)
+        }
+    }
+
+    /// Open the dialog in STT live mode with an empty transcript. Subsequent
+    /// `updateLive(text:)` calls re-render the chunks as partials arrive.
+    func showLive() {
+        Log.info("[DIALOG] showLive")
+        DispatchQueue.main.async { [weak self] in
+            self?.mode = .sttLive
+            self?.showOnMain(text: "", chunks: [], playbackRate: 1.0)
+        }
+    }
+
+    /// Replace the live transcript content. The text is re-chunked through the
+    /// same TextChunker pipeline so styling/colors match TTS exactly.
+    func updateLive(text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.mode = .sttLive
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let chunks = trimmed.isEmpty
+                ? []
+                : TextChunker.split(trimmed, profile: ConfigManager.ttsChunkProfile(for: .fast))
+            self.loadChunksOnMain(text: trimmed, chunks: chunks, playbackRate: 1.0)
+        }
+    }
+
+    /// Switch to editable post-recording / recalled-text mode with `text`
+    /// pre-loaded and chunks made `contenteditable` so the user can fix typos.
+    func setEditMode(text: String) {
+        Log.info("[DIALOG] setEditMode (\(text.count) chars)")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.mode = .sttEdit
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let chunks = trimmed.isEmpty
+                ? []
+                : TextChunker.split(trimmed, profile: ConfigManager.ttsChunkProfile(for: .fast))
+            if self.window == nil { self.buildWindow() }
+            self.showOnMain(text: trimmed, chunks: chunks, playbackRate: 1.0)
+        }
+    }
+
+    /// Read the currently displayed text back from the webview, including any
+    /// edits the user made in `.sttEdit` mode. Returns plain text.
+    func currentEditedText() async -> String {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { [weak self] in
+                guard let webView = self?.webView else {
+                    continuation.resume(returning: "")
+                    return
+                }
+                webView.evaluateJavaScript("getEditedText()") { result, _ in
+                    continuation.resume(returning: (result as? String) ?? "")
+                }
+            }
         }
     }
 
@@ -89,15 +157,7 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
         if window == nil { buildWindow() }
         guard let window, let webView else { Log.error("[DIALOG] window missing"); return }
 
-        let payload = DialogCapabilities.buildPayload(chunks: chunks, playbackRate: playbackRate)
-        currentPayload = payload
-        currentMarkdownSource = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        currentPlainSource = DialogCapabilities.plainText(from: TextPrettifier.prettify(text))
-
-        let data = try? JSONEncoder().encode(payload)
-        let json = String(data: data ?? Data("{\"chunks\":[],\"playbackRate\":1}".utf8), encoding: .utf8)
-            ?? "{\"chunks\":[],\"playbackRate\":1}"
-        webView.evaluateJavaScript("loadChunks(\(json))", completionHandler: nil)
+        let payload = loadChunksPayload(text: text, chunks: chunks, playbackRate: playbackRate)
 
         resizeWindowForCurrentSpeech(payload: payload, window: window)
         webView.frame = window.contentView?.bounds ?? window.frame
@@ -115,6 +175,39 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
             window.animator().alphaValue = 1.0
         }
         hasPresentedWindow = true
+    }
+
+    /// Refresh the dialog contents in place without re-presenting the window.
+    /// Used by `updateLive(text:)` so live partials don't keep stealing focus.
+    private func loadChunksOnMain(text: String, chunks: [String], playbackRate: Float) {
+        if window == nil { buildWindow() }
+        guard let window, let webView else { return }
+        let payload = loadChunksPayload(text: text, chunks: chunks, playbackRate: playbackRate)
+        if !window.isVisible {
+            resizeWindowForCurrentSpeech(payload: payload, window: window)
+            webView.frame = window.contentView?.bounds ?? window.frame
+            promoteAppForWindowing()
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(webView)
+            hasPresentedWindow = true
+        }
+    }
+
+    /// Encode + push the chunk payload (with current mode) to JS. Returns the
+    /// payload so callers can use it to size the window.
+    @discardableResult
+    private func loadChunksPayload(text: String, chunks: [String], playbackRate: Float) -> DialogPayload {
+        let payload = DialogCapabilities.buildPayload(chunks: chunks, playbackRate: playbackRate)
+        currentPayload = payload
+        currentMarkdownSource = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        currentPlainSource = DialogCapabilities.plainText(from: TextPrettifier.prettify(text))
+
+        let data = try? JSONEncoder().encode(payload)
+        let json = String(data: data ?? Data("{\"chunks\":[],\"playbackRate\":1}".utf8), encoding: .utf8)
+            ?? "{\"chunks\":[],\"playbackRate\":1}"
+        let modeLiteral = "'\(mode.rawValue)'"
+        webView?.evaluateJavaScript("loadChunks(\(json), \(modeLiteral))", completionHandler: nil)
+        return payload
     }
 
     private func resizeWindowForCurrentSpeech(payload: DialogPayload, window: NSWindow) {
@@ -230,6 +323,7 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     }
 
     private func closeOnMain() {
+        mode = .tts
         guard let window else { return }
         window.orderOut(nil)
         maybeRestoreMenuBarOnly()
@@ -322,6 +416,9 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
         if localKeyMonitor == nil {
             localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 guard let self, let window = self.window, NSApp.keyWindow === window else { return event }
+                // Only intercept the f/r record shortcut in TTS mode — in STT
+                // edit mode the user is typing prose, so 'f' must reach the field.
+                guard self.mode == .tts else { return event }
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if flags.contains(.command) || flags.contains(.control) || flags.contains(.option) {
                     return event
@@ -382,6 +479,14 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
                 if let index = body["index"] as? Int {
                     self?.showVoiceMenu(forChunk: index)
                 }
+            },
+            "submit": { [weak self] _ in
+                Log.info("[DIALOG] JS submit")
+                self?.onSubmit?()
+            },
+            "cancel": { [weak self] _ in
+                Log.info("[DIALOG] JS cancel")
+                self?.onCancel?()
             },
         ]
         handlers[action]?(body)
@@ -469,35 +574,36 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
       radial-gradient(circle at 18% -8%,rgba(240,179,91,.18),transparent 34%),
       radial-gradient(circle at 120% 15%,rgba(127,183,240,.12),transparent 30%),
       linear-gradient(180deg,#1d1b19 0%,var(--bg-panel) 44%,#121110 100%);
-      font-family:"Iowan Old Style","Charter","Georgia",ui-serif,serif;
-      font-size:20px;line-height:1.55;letter-spacing:.005em;
+      font-family:-apple-system,"SF Pro Text","Avenir Next",system-ui,sans-serif;
+      font-size:17px;line-height:1.5;letter-spacing:0;
       color:var(--text-body);
-      padding:56px 28px 86px;overflow-y:auto;overflow-x:hidden;
+      padding:58px 34px 84px;overflow-y:auto;overflow-x:hidden;
       -webkit-font-smoothing:antialiased;user-select:none;cursor:default}
     body::-webkit-scrollbar{width:0}
-    #content{max-width:58ch;margin:0 auto;padding:2px 0}
+    #content{max-width:72ch;margin:0 auto;padding:2px 0}
 
-    /* Chunks are quiet cards: readable as prose, but structured enough to scan. */
-    .chunk{display:block;position:relative;margin:1.05em 0;padding:18px 62px 18px 50px;
-      border:1px solid transparent;border-left:3px solid transparent;border-radius:18px;
+    /* Chunks stay in document flow; the gutter/active state exposes playback without rewriting layout. */
+    .chunk{display:block;position:relative;margin:.22em 0;padding:4px 46px 4px 14px;
+      border:1px solid transparent;border-left:2px solid transparent;border-radius:10px;
       background:transparent;box-shadow:none;
       transition:color 180ms ease,border-color 180ms ease,background 180ms ease,box-shadow 180ms ease,transform 180ms ease}
     .chunk.enabled{cursor:pointer}
-    .chunk.enabled:hover{color:var(--text-active);background:var(--bg-card-hover);border-color:var(--rule)}
-    .chunk.disabled{color:var(--text-done)}
-    .chunk.active{color:var(--text-active);border-color:rgba(240,179,91,.24);border-left-color:var(--accent);
-      background:linear-gradient(135deg,rgba(240,179,91,.13),rgba(255,248,232,.045) 42%,rgba(0,0,0,.08));
-      box-shadow:var(--shadow);transform:translateY(-1px)}
+    .chunk.enabled:hover{color:var(--text-active);background:rgba(255,248,232,.045);border-color:rgba(238,234,226,.08)}
+    .chunk.disabled{color:rgba(238,234,226,.74)}
+    .chunk.active{color:var(--text-active);border-color:rgba(240,179,91,.18);border-left-color:var(--accent);
+      background:linear-gradient(90deg,rgba(240,179,91,.12),rgba(255,248,232,.035) 18%,transparent);
+      box-shadow:0 8px 28px rgba(0,0,0,.13);transform:none}
     .chunk.question{border-left-color:rgba(127,183,240,.38)}
     .chunk.question.active{border-color:rgba(127,183,240,.28);border-left-color:var(--accent-question);
-      background:linear-gradient(135deg,rgba(127,183,240,.16),rgba(255,248,232,.045) 48%,rgba(0,0,0,.08))}
-    .chunk.done{color:var(--text-done);transition:color 220ms ease}
+      background:linear-gradient(90deg,rgba(127,183,240,.13),rgba(255,248,232,.035) 18%,transparent)}
+    .chunk.done{color:rgba(238,234,226,.48);transition:color 220ms ease}
     .finished .chunk{color:var(--text-body);border-left-color:transparent}
     .chunk-body{position:relative;white-space:normal;overflow-wrap:break-word;word-break:normal}
-    .chunk-index{position:absolute;left:18px;top:20px;
-      font-family:-apple-system,"SF Pro Text",system-ui,sans-serif;font-size:11px;font-weight:700;
-      color:rgba(238,234,226,.42);letter-spacing:.08em}
-    .chunk-kind{position:absolute;right:42px;top:-9px;height:18px;padding:0 8px;border-radius:999px;
+    .chunk-index{position:absolute;left:-26px;top:7px;
+      font-family:-apple-system,"SF Pro Text",system-ui,sans-serif;font-size:10px;font-weight:700;
+      color:rgba(238,234,226,.42);letter-spacing:.08em;opacity:0;transition:opacity 140ms ease}
+    .chunk.active .chunk-index,.chunk:hover .chunk-index{opacity:.58}
+    .chunk-kind{position:absolute;right:42px;top:-8px;height:18px;padding:0 8px;border-radius:999px;
       font-family:-apple-system,"SF Pro Text",system-ui,sans-serif;font-size:9px;font-weight:700;line-height:18px;
       letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.72);
       background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.08);opacity:0}
@@ -507,20 +613,20 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     .chunk.list-item .chunk-kind{background:rgba(217,202,131,.14);border-color:rgba(217,202,131,.20);color:#F4E6A6}
     .chunk.table-row .chunk-kind,.chunk.table-header .chunk-kind{background:rgba(185,168,243,.15);border-color:rgba(185,168,243,.22);color:#E4DBFF}
 
-    .chunk-copy,.chunk-voice{position:absolute;top:2px;width:26px;height:26px;border:none;border-radius:50%;
+    .chunk-copy,.chunk-voice{position:absolute;top:2px;width:24px;height:24px;border:none;border-radius:50%;
       background:rgba(255,255,255,.06);color:var(--text-muted);opacity:0;cursor:pointer;
-      transition:opacity 140ms ease,background 140ms ease,color 140ms ease;font-size:12px;line-height:26px}
-    .chunk-copy{right:0}
-    .chunk-voice{right:32px}
+      transition:opacity 140ms ease,background 140ms ease,color 140ms ease;font-size:11px;line-height:24px}
+    .chunk-copy{right:6px}
+    .chunk-voice{right:34px}
     .chunk:hover .chunk-copy,.chunk.active .chunk-copy,.chunk:hover .chunk-voice,.chunk.active .chunk-voice{opacity:1}
     .chunk-copy:hover,.chunk-voice:hover{background:rgba(255,255,255,.14);color:var(--text-active)}
     .word-jump{
-      display:inline;white-space:normal;cursor:pointer;border-radius:6px;padding:0 1px;
+      display:inline;white-space:normal;cursor:pointer;border-radius:4px;padding:0;
       transition:background 120ms ease,color 120ms ease,box-shadow 120ms ease
     }
     .word-jump.active-word{
-      color:var(--text-active);background:rgba(240,179,91,.16);
-      box-shadow:inset 0 -1px rgba(240,179,91,.34),0 0 0 1px rgba(240,179,91,.14)
+      color:var(--text-active);background:rgba(240,179,91,.14);
+      box-shadow:inset 0 -1px rgba(240,179,91,.34)
     }
     .word-jump:hover{
       color:var(--text-active);background:rgba(240,179,91,.12);
@@ -532,9 +638,9 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     em{font-style:italic}
     h1,h2,h3{font-family:-apple-system,"SF Pro Text",system-ui,sans-serif;
       line-height:1.25;color:var(--text-active)}
-    h1{font-size:28px;font-weight:600;margin:1.6em 0 .5em}
-    h2{font-size:22px;font-weight:600;margin:1.4em 0 .4em}
-    h3{font-size:18px;font-weight:600;margin:1.2em 0 .3em;color:var(--text-muted)}
+    h1{font-size:24px;font-weight:700;margin:1.1em 0 .45em}
+    h2{font-size:20px;font-weight:700;margin:.95em 0 .35em}
+    h3{font-size:17px;font-weight:700;margin:.8em 0 .25em;color:var(--text-active)}
     code{font-family:"SF Mono","JetBrains Mono",ui-monospace,monospace;
       font-size:.88em;background:rgba(142,212,168,.10);color:#CFF6DA;
       padding:2px 6px;border-radius:6px;border:1px solid rgba(142,212,168,.13)}
@@ -575,13 +681,14 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
 
     /* Special chunk types stay readable while adding scan-friendly cues. */
     .chunk.header-chunk{font-family:-apple-system,"SF Pro Text",system-ui,sans-serif;
-      font-size:22px;font-weight:700;color:var(--text-muted);background:rgba(255,255,255,.035)}
+      font-size:18px;font-weight:700;color:var(--text-active);background:transparent;margin:.72em 0 .24em}
     .chunk.header-chunk.active{color:var(--text-active)}
     .chunk.code-chunk{font-family:"SF Mono","JetBrains Mono",ui-monospace,monospace;
-      font-size:14px;background:linear-gradient(135deg,rgba(142,212,168,.11),rgba(255,255,255,.035));
-      padding:18px 62px 18px 50px;border-radius:18px;white-space:pre-wrap;line-height:1.5}
-    .chunk.list-item{padding-left:54px;position:relative;margin-left:0}
-    .chunk.list-item::before{content:'\\2022';position:absolute;left:28px;top:18px;color:var(--accent-list);opacity:.9}
+      font-size:14px;background:linear-gradient(90deg,rgba(142,212,168,.10),rgba(255,255,255,.025));
+      padding:9px 46px 9px 14px;border-radius:12px;white-space:pre-wrap;line-height:1.45}
+    .chunk.list-item{padding-left:14px;position:relative;margin:.16em 0}
+    .chunk.list-item .chunk-body{padding-left:1.25em;text-indent:-1.25em}
+    .list-bullet{color:var(--accent-list);font-weight:800;margin-right:.25em}
     .kv-row{display:flex;gap:10px;padding:3px 0;align-items:baseline}
     .kv-key{color:var(--accent);font-weight:600;font-size:.82em;text-transform:uppercase;
       letter-spacing:.5px;min-width:60px;flex-shrink:0}
@@ -597,6 +704,46 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
       transition:all 120ms ease;padding:0 10px;font-family:-apple-system,system-ui,sans-serif}
     .ctrl-btn.icon{width:28px;padding:0;border-radius:50%;font-size:13px}
     .ctrl-btn:hover{background:rgba(255,255,255,.14);color:var(--text-active)}
+    /* Mode-specific control visibility — body[data-mode] is set by setMode(). */
+    .edit-only{display:none}
+    body[data-mode="stt-live"] .tts-only,
+    body[data-mode="stt-edit"] .tts-only{display:none}
+    body[data-mode="stt-edit"] .edit-only{display:inline-block}
+    body[data-mode="stt-edit"] #insertBtn{
+      background:rgba(240,179,91,.22);color:var(--accent);
+      border:1px solid rgba(240,179,91,.32);font-weight:600
+    }
+    body[data-mode="stt-edit"] #insertBtn:hover{
+      background:rgba(240,179,91,.32);color:var(--text-active)
+    }
+    /* In STT modes, voice/copy chunk buttons and click-to-jump just clutter. */
+    body[data-mode="stt-live"] .chunk-voice,
+    body[data-mode="stt-edit"] .chunk-voice,
+    body[data-mode="stt-live"] .chunk-copy,
+    body[data-mode="stt-edit"] .chunk-copy,
+    body[data-mode="stt-live"] .chunk-kind,
+    body[data-mode="stt-edit"] .chunk-kind,
+    body[data-mode="stt-live"] .chunk-index,
+    body[data-mode="stt-edit"] .chunk-index{display:none}
+    body[data-mode="stt-edit"] .chunk{cursor:text}
+    body[data-mode="stt-edit"] .chunk-body[contenteditable]{
+      outline:none;border-radius:6px;padding:1px 4px;margin:-1px -4px;
+      transition:background 120ms ease,box-shadow 120ms ease
+    }
+    body[data-mode="stt-edit"] .chunk-body[contenteditable]:focus{
+      background:rgba(240,179,91,.06);
+      box-shadow:inset 0 0 0 1px rgba(240,179,91,.22)
+    }
+    /* Status caption — replaces the centered LiveCaptionPanel hint. */
+    #modeHint{position:fixed;top:14px;left:50%;transform:translateX(-50%);
+      font-family:-apple-system,system-ui,sans-serif;font-size:11px;font-weight:500;
+      color:var(--text-muted);padding:5px 12px;border-radius:999px;
+      background:rgba(10,10,10,.26);backdrop-filter:blur(18px);
+      border:1px solid rgba(255,255,255,.08);z-index:90;
+      opacity:0;transition:opacity 160ms ease;pointer-events:none;white-space:nowrap}
+    body[data-mode="stt-live"] #modeHint,
+    body[data-mode="stt-edit"] #modeHint{opacity:1}
+    body[data-mode="stt-live"] #modeHint::before{content:"\\1F3A4  "}
 
     .error{color:#fca5a5;font-weight:500;text-align:center;padding:20px;
       font-family:-apple-system,system-ui,sans-serif}
@@ -610,6 +757,8 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     #prog{height:3px;width:188px;background:var(--rule);border-radius:999px;overflow:hidden}
     #prog::after{content:'';display:block;height:100%;width:var(--p,0%);
       background:var(--accent);border-radius:1px;transition:width 220ms ease}
+    body[data-mode="stt-live"] #progressWrap,
+    body[data-mode="stt-edit"] #progressWrap{display:none}
 
     /* Respect macOS Reduce Motion + Increase Contrast. */
     @media (prefers-reduced-motion: reduce){
@@ -621,11 +770,13 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     }
     </style></head><body>
     <div class="top-controls">
-      <button class="ctrl-btn" onclick="post('record')" title="Record / stop recording (F or Fn)">Rec</button>
+      <button class="ctrl-btn tts-only" onclick="post('record')" title="Record / stop recording (F or Fn)">Rec</button>
       <button class="ctrl-btn" onclick="copyAll(event,'plain')" title="Copy all plain text">Copy</button>
-      <button class="ctrl-btn" onclick="copyAll(event,'markdown')" title="Copy all Markdown">MD</button>
-      <button class="ctrl-btn icon" id="pauseBtn" onclick="post('pause')" title="Pause/Resume (Ctrl+Option)">&#9208;</button>
+      <button class="ctrl-btn tts-only" onclick="copyAll(event,'markdown')" title="Copy all Markdown">MD</button>
+      <button class="ctrl-btn icon tts-only" id="pauseBtn" onclick="post('pause')" title="Pause/Resume (Ctrl+Option)">&#9208;</button>
+      <button class="ctrl-btn edit-only" id="insertBtn" onclick="post('submit')" title="Insert into the focused app (Fn or ⏎)">Insert &#9166;</button>
     </div>
+    <div id="modeHint"></div>
     <div id="content"></div>
     <div id="progressWrap">
       <div id="progressLabel"></div>
@@ -690,7 +841,8 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     function renderArrowRow(s){const p=s.split(ARROW).map(x=>x.trim());
       return '<div class="kv-row"><span class="kv-key" style="text-transform:none;font-size:1em;">'+inlineMd(p[0])+'</span><span class="kv-val">'+inlineMd(p.slice(1).join(' '+ARROW+' '))+'</span></div>';}
     function md(s){
-      if(/^[-*] /.test(s.trim())||/^\\d{1,3}[\\.\\)] /.test(s.trim()))s=s.trim().replace(/^[-*]\\s+/,'').replace(/^\\d{1,3}[\\.\\)]\\s+/,'');
+      const trimmed=s.trim();
+      if(/^[-*]\\s+/.test(trimmed))return '<span class="list-bullet">\\u2022</span>'+inlineMd(trimmed.replace(/^[-*]\\s+/,''));
       if(BOX.test(s))return '<pre><code>'+s.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</code></pre>';
       if(isPipeTable(s))return renderPipeTable(s);
       if(isKVChunk(s))return renderKV(s);
@@ -868,7 +1020,29 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
     let activeIdx=-1;
     let activeWordEl=null;
     let currentPayload={chunks:[],playbackRate:1};
+    let dialogMode='tts';
     const enabledSet=new Set();
+
+    function setMode(mode){
+      dialogMode=mode||'tts';
+      document.body.dataset.mode=dialogMode;
+      const hint=document.getElementById('modeHint');
+      if(hint){
+        if(dialogMode==='stt-live')hint.textContent='Recording — press Fn to stop';
+        else if(dialogMode==='stt-edit')hint.textContent='Edit if you like, then press Fn or ⏎ to insert (Esc cancels)';
+        else hint.textContent='';
+      }
+    }
+
+    function getEditedText(){
+      const bodies=document.querySelectorAll('#content .chunk .chunk-body');
+      const parts=[];
+      bodies.forEach(body=>{
+        const text=(body.innerText||body.textContent||'').replace(/\\s+/g,' ').trim();
+        if(text)parts.push(text);
+      });
+      return parts.join('\\n\\n');
+    }
 
     function estimateSeconds(words,rate){
       const wpm=165*Math.max(0.75,rate||1);
@@ -897,30 +1071,52 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
       label.textContent='paragraph '+(current+1)+' of '+total+' · '+formatEta(estimateSeconds(remainingWords,currentPayload.playbackRate));
     }
 
-    function loadChunks(payload){
+    function loadChunks(payload,mode){
+      setMode(mode||dialogMode||'tts');
       currentPayload=payload||{chunks:[],playbackRate:1};
       const el=document.getElementById('content');
       el.className='';
       enabledSet.clear();
       activeIdx=-1;
       activeWordEl=null;
+      const isSTT=dialogMode==='stt-live'||dialogMode==='stt-edit';
+      const editable=dialogMode==='stt-edit';
+      // STT chunks aren't gated by playback, so skip the disabled state.
+      const baseClass=isSTT?'chunk enabled':'chunk disabled';
       el.innerHTML=currentPayload.chunks.map((chunk,i)=>{
         const ct=chunkType(chunk.markdown);
         const question=chunk.isQuestion?' question':'';
         const kind=chunkKindLabel(ct,chunk);
         const kindBadge=kind?'<span class="chunk-kind">'+kind+'</span>':'';
-        return '<div class="chunk disabled'+(ct?' '+ct:'')+question+'" data-i="'+i+'" onclick="tryJump('+i+')"><span class="chunk-index">'+chunkIndexLabel(i)+'</span>'+kindBadge+'<button class="chunk-voice" onclick="openVoiceMenu(event,'+i+')" title="Replay paragraph with a different voice">&#128266;</button><button class="chunk-copy" onclick="copyChunk(event,'+i+')" title="Copy paragraph">&#10697;</button><div class="chunk-body">'+md(chunk.markdown)+'</div></div>';
+        const onclickAttr=isSTT?'':' onclick="tryJump('+i+')"';
+        const editAttr=editable?' contenteditable="true" spellcheck="true"':'';
+        return '<div class="'+baseClass+(ct?' '+ct:'')+question+'" data-i="'+i+'"'+onclickAttr+'><span class="chunk-index">'+chunkIndexLabel(i)+'</span>'+kindBadge+'<button class="chunk-voice" onclick="openVoiceMenu(event,'+i+')" title="Replay paragraph with a different voice">&#128266;</button><button class="chunk-copy" onclick="copyChunk(event,'+i+')" title="Copy paragraph">&#10697;</button><div class="chunk-body"'+editAttr+'>'+md(chunk.markdown)+'</div></div>';
       }).join('');
       currentPayload.chunks.forEach((chunk,i)=>{
         const node=document.querySelector('[data-i="'+i+'"]');
         if(node){
           decorateChunk(node,chunk);
-          makeWordsClickable(node,i);
+          // Word-level click-to-jump only makes sense for TTS playback.
+          if(!isSTT)makeWordsClickable(node,i);
         }
       });
       updateProgressLabel(-1);
       const prog=document.getElementById('prog');
       if(prog)prog.style.setProperty('--p','0%');
+      // Auto-focus the first editable chunk so the user can start typing
+      // immediately when the dialog flips to edit mode.
+      if(editable){
+        const firstBody=el.querySelector('.chunk-body[contenteditable]');
+        if(firstBody){
+          firstBody.focus();
+          const range=document.createRange();
+          range.selectNodeContents(firstBody);
+          range.collapse(false);
+          const sel=window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+      }
     }
 
     function enableChunk(i){
@@ -1020,7 +1216,30 @@ final class TTSDialog: NSObject, WKScriptMessageHandler, NSWindowDelegate {
       }
     });
 
+    // contenteditable="true" preserves entity highlights, but lets rich-text
+    // paste through. Strip formatting on paste so the field stays plain prose.
+    document.addEventListener('paste',e=>{
+      if(dialogMode!=='stt-edit')return;
+      const target=e.target&&e.target.closest&&e.target.closest('.chunk-body[contenteditable]');
+      if(!target)return;
+      e.preventDefault();
+      const text=(e.clipboardData||window.clipboardData).getData('text/plain');
+      document.execCommand('insertText',false,text);
+    });
+
     document.addEventListener('keydown',e=>{
+      // STT edit mode: ⌘⏎ submits, Esc cancels. Everything else is normal text input.
+      if(dialogMode==='stt-edit'){
+        if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();post('submit');return;}
+        if(e.key==='Escape'){e.preventDefault();post('cancel');return;}
+        return;
+      }
+      // STT live mode: only Esc closes; the rest passes through.
+      if(dialogMode==='stt-live'){
+        if(e.key==='Escape'){e.preventDefault();post('cancel');}
+        return;
+      }
+      // TTS playback shortcuts.
       if((e.key==='f'||e.key==='F'||e.key==='r'||e.key==='R')&&!e.metaKey&&!e.ctrlKey&&!e.altKey){
         e.preventDefault();
         post('record');

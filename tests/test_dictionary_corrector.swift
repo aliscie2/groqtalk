@@ -17,7 +17,8 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
 struct DictionaryCorrectorTests {
     static func main() {
         let entries = [
-            ConfigManager.DictionaryEntry(canonical: "qwen", aliases: ["quan"]),
+            ConfigManager.DictionaryEntry(canonical: "qwen", aliases: ["quinn", "quan"]),
+            ConfigManager.DictionaryEntry(canonical: "qwen AI", aliases: ["quinn ai", "quan ai", "coin ai"]),
             ConfigManager.DictionaryEntry(canonical: "Tauri", aliases: ["tori"]),
             ConfigManager.DictionaryEntry(canonical: "TypeScript", aliases: ["type script", "typescript"]),
         ]
@@ -25,6 +26,16 @@ struct DictionaryCorrectorTests {
         expect(
             DictionaryCorrector.apply(to: "Quan is faster than before.", entries: entries) == "qwen is faster than before.",
             "Expected explicit alias to map Quan to qwen"
+        )
+        expect(
+            DictionaryCorrector.apply(to: "Okay, and Quinn AI is very important.", entries: entries)
+                == "Okay, and qwen AI is very important.",
+            "Expected explicit phrase alias to map Quinn AI to qwen AI"
+        )
+        expect(
+            DictionaryCorrector.apply(to: "We can use coin AI on small machines.", entries: entries)
+                == "We can use qwen AI on small machines.",
+            "Expected contextual phrase alias to map coin AI without replacing coin globally"
         )
         expect(
             DictionaryCorrector.apply(to: "tori app", entries: entries) == "Tauri app",

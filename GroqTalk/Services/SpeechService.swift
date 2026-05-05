@@ -606,7 +606,14 @@ enum SpeechService {
             try Task.checkCancellation()
             let wavData: Data
             if let task = fetchTasks[i] { wavData = try await task.value }
-            else { Log.error("[TTS] no fetch task for chunk \(i)"); break }
+            else {
+                if Task.isCancelled || player.cancelled {
+                    Log.info("[TTS] playback loop stopped before chunk \(i) — fetch task was cancelled")
+                } else {
+                    Log.error("[TTS] no fetch task for chunk \(i)")
+                }
+                break
+            }
             guard !wavData.isEmpty else { break }
             try Task.checkCancellation()
 
@@ -619,10 +626,7 @@ enum SpeechService {
             if showDialog {
                 await MainActor.run {
                     TTSDialog.shared.setActiveChunk(dialogIndex)
-                    TTSDialog.shared.setActiveWord(
-                        dialogIndex: dialogIndex,
-                        wordIndex: highlightPlan?.startWordIndex
-                    )
+                    TTSDialog.shared.setActiveWord(dialogIndex: dialogIndex, wordIndex: nil)
                 }
             }
 
@@ -647,7 +651,7 @@ enum SpeechService {
                 } else {
                     nil
                 }
-            var lastHighlightedWordIndex = highlightPlan?.startWordIndex
+            var lastHighlightedWordIndex: Int?
             setPlaybackContext(dialogIndex: dialogIndex, wordTracker: wordTracker)
             await player.play(
                 data: wavData,

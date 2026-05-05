@@ -43,8 +43,13 @@ struct TimedWordMatcherTests {
         )
 
         expect(
+            tracker.currentWordIndex(currentTime: 0.40, duration: 1.0) == 1,
+            "Expected visual lag to avoid highlighting the next word before it is spoken"
+        )
+
+        expect(
             tracker.currentWordIndex(currentTime: 0.70, duration: 1.0) == 2,
-            "Expected tracker to advance according to exact timings"
+            "Expected tracker to advance once exact timing plus visual lag has passed"
         )
 
         expect(
@@ -53,6 +58,11 @@ struct TimedWordMatcherTests {
         )
 
         let estimatedTracker = LiveWordTracker(startWordIndex: 4, playableWordCount: 4, startTime: 0)
+        expect(
+            estimatedTracker.currentWordIndex(currentTime: 4.0, duration: 8.0) == nil,
+            "Expected live highlighting to wait for exact alignment instead of using fake estimated timings"
+        )
+
         expect(
             abs((estimatedTracker.playbackTime(forWordIndex: 6, duration: 8.0) ?? -1) - 4.0) < 0.001,
             "Expected tracker to estimate a seek time before exact timings arrive"

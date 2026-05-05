@@ -19,13 +19,16 @@ final class HotkeyService {
     fileprivate static var fnCallback: (() -> Void)?
     fileprivate static var fnDown = false
     fileprivate static var fnDirtied = false
+    fileprivate static var fnShiftCallback: (() -> Void)?
+    fileprivate static var fnShiftDown = false
+    fileprivate static var fnShiftDirtied = false
     fileprivate static var fnCtrlCallback: (() -> Void)?
     fileprivate static var fnCtrlDown = false
     fileprivate static var fnCtrlDirtied = false
     fileprivate static var ctrlOptCallback: (() -> Void)?
     fileprivate static var ctrlOptDown = false
     fileprivate static var ctrlOptDirtied = false
-    fileprivate static var transientKeyHandler: ((CGEventType, CGKeyCode) -> Bool)?
+    fileprivate static var transientKeyHandler: ((CGEventType, CGKeyCode, CGEventFlags) -> Bool)?
 
     fileprivate static weak var sharedTap: HotkeyService?
 
@@ -45,14 +48,16 @@ final class HotkeyService {
         if status == noErr { Log.debug("Carbon event handler installed") }
     }
 
-    // MARK: - Fn / Fn+Ctrl / Ctrl+Option (CGEvent tap with auto-retry)
+    // MARK: - Fn / Shift+Fn / Fn+Ctrl / Ctrl+Option (CGEvent tap with auto-retry)
 
     func installModifierHotkeys(
         fnAction: @escaping () -> Void,
+        fnShiftAction: @escaping () -> Void,
         fnCtrlAction: @escaping () -> Void,
         ctrlOptAction: @escaping () -> Void
     ) {
         HotkeyService.fnCallback = fnAction
+        HotkeyService.fnShiftCallback = fnShiftAction
         HotkeyService.fnCtrlCallback = fnCtrlAction
         HotkeyService.ctrlOptCallback = ctrlOptAction
 
@@ -123,7 +128,7 @@ final class HotkeyService {
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         HotkeyService.sharedTap = self
-        Log.info("[HOTKEY] Fn + Ctrl+Option tap installed!")
+        Log.info("[HOTKEY] Fn + Shift+Fn + Ctrl+Option tap installed!")
         return true
     }
 
@@ -160,7 +165,7 @@ final class HotkeyService {
         Log.debug("[HOTKEY] tap re-enabled")
     }
 
-    func setTransientKeyHandler(_ handler: ((CGEventType, CGKeyCode) -> Bool)?) {
+    func setTransientKeyHandler(_ handler: ((CGEventType, CGKeyCode, CGEventFlags) -> Bool)?) {
         HotkeyService.transientKeyHandler = handler
     }
 
@@ -172,6 +177,7 @@ final class HotkeyService {
         hotkeyRefs.removeAll()
         HotkeyService.callbacks.removeAll()
         HotkeyService.fnCallback = nil
+        HotkeyService.fnShiftCallback = nil
         HotkeyService.fnCtrlCallback = nil
         HotkeyService.ctrlOptCallback = nil
         HotkeyService.transientKeyHandler = nil
@@ -231,11 +237,19 @@ private func modifierCallback(
         let hasOpt = f.contains(.maskAlternate)
         let hasCmd = f.contains(.maskCommand)
         let hasShift = f.contains(.maskShift)
+        let wasTrackingFnGesture = HotkeyService.fnDown
+            || HotkeyService.fnShiftDown
+            || HotkeyService.fnCtrlDown
 
         updateSoloModifier(
             pressed: hasFn, otherMods: hasCtrl || hasOpt || hasCmd || hasShift,
             down: &HotkeyService.fnDown, dirtied: &HotkeyService.fnDirtied,
-            callback: HotkeyService.fnCallback, label: nil
+            callback: HotkeyService.fnCallback, label: "fn"
+        )
+        updateSoloModifier(
+            pressed: hasFn && hasShift, otherMods: hasCtrl || hasOpt || hasCmd,
+            down: &HotkeyService.fnShiftDown, dirtied: &HotkeyService.fnShiftDirtied,
+            callback: HotkeyService.fnShiftCallback, label: "shift+fn"
         )
         updateSoloModifier(
             pressed: hasFn && hasCtrl, otherMods: hasOpt || hasCmd || hasShift,
@@ -247,12 +261,17 @@ private func modifierCallback(
             down: &HotkeyService.ctrlOptDown, dirtied: &HotkeyService.ctrlOptDirtied,
             callback: HotkeyService.ctrlOptCallback, label: "ctrl+opt"
         )
+
+        if hasFn || wasTrackingFnGesture {
+            return nil
+        }
     } else if type == .keyDown || type == .keyUp {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        if let handler = HotkeyService.transientKeyHandler, handler(type, keyCode) {
+        if let handler = HotkeyService.transientKeyHandler, handler(type, keyCode, event.flags) {
             return nil
         }
         if HotkeyService.fnDown { HotkeyService.fnDirtied = true }
+        if HotkeyService.fnShiftDown { HotkeyService.fnShiftDirtied = true }
         if HotkeyService.fnCtrlDown { HotkeyService.fnCtrlDirtied = true }
         if HotkeyService.ctrlOptDown { HotkeyService.ctrlOptDirtied = true }
     }

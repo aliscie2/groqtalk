@@ -11,12 +11,19 @@ final class LiveWordTracker: @unchecked Sendable {
     private let startWordIndex: Int
     private let playableWordCount: Int
     private let startTime: TimeInterval
+    private let visualLag: TimeInterval
     private var exactWords: [TimedDialogWord] = []
 
-    init(startWordIndex: Int, playableWordCount: Int, startTime: TimeInterval) {
+    init(
+        startWordIndex: Int,
+        playableWordCount: Int,
+        startTime: TimeInterval,
+        visualLag: TimeInterval = 0.12
+    ) {
         self.startWordIndex = startWordIndex
         self.playableWordCount = playableWordCount
         self.startTime = startTime
+        self.visualLag = visualLag
     }
 
     func applyExactWords(_ words: [TimedDialogWord]) {
@@ -34,18 +41,9 @@ final class LiveWordTracker: @unchecked Sendable {
         let words = exactWords
         lock.unlock()
 
-        let relativeTime = max(0, currentTime - startTime)
-        if !words.isEmpty {
-            return TimedWordMatcher.wordIndex(at: relativeTime, in: words)
-        }
-
-        return WordHighlightEstimator.estimatedWordIndex(
-            startWordIndex: startWordIndex,
-            playableWordCount: playableWordCount,
-            currentTime: currentTime,
-            duration: duration,
-            startTime: startTime
-        )
+        guard !words.isEmpty else { return nil }
+        let relativeTime = max(0, currentTime - startTime - visualLag)
+        return TimedWordMatcher.wordIndex(at: relativeTime, in: words)
     }
 
     func playbackTime(forWordIndex wordIndex: Int, duration: TimeInterval) -> TimeInterval? {

@@ -14,19 +14,26 @@ enum TranscriptionService {
         SharedSpeechServerHealth.noteRestart()
     }
 
+    /// Run the full STT pipeline. Returns the cleaned transcript text on
+    /// success, or nil on any failure / empty audio. When `autoInsert` is
+    /// true (legacy default), the cleaned text is also pasted into
+    /// `insertionTarget`. When false, the caller is responsible for the paste
+    /// (used by the editable-dialog flow).
+    @discardableResult
     static func process(
         buffers: [AVAudioPCMBuffer], api: GroqAPIClient,
         history: HistoryManager, usage: UsageTracker,
         sttMode: ConfigManager.STTMode = .parakeet,
-        insertionTarget: ClipboardService.InsertionTarget? = nil
-    ) async {
+        insertionTarget: ClipboardService.InsertionTarget? = nil,
+        autoInsert: Bool = true
+    ) async -> String? {
         let start = CFAbsoluteTimeGetCurrent()
         Log.info("[STT] final pipeline started, buffers=\(buffers.count)")
 
         do {
             guard !buffers.isEmpty else {
                 NotificationHelper.sendStatus("\u{274C} No audio captured.")
-                return
+                return nil
             }
 
             NotificationHelper.sendStatus("\u{231B} Processing audio...")
@@ -35,13 +42,13 @@ enum TranscriptionService {
 
             guard duration >= 0.5 else {
                 NotificationHelper.sendStatus("\u{274C} Recording too short.")
-                return
+                return nil
             }
 
             let rawAudio = AudioProcessor.concatenate(buffers)
             guard !AudioProcessor.isAudioSilent(rawAudio) else {
                 NotificationHelper.sendStatus("\u{274C} No sound detected.")
-                return
+                return nil
             }
 
             // Save recording immediately — before API call
@@ -59,19 +66,23 @@ enum TranscriptionService {
                 duration: duration,
                 history: history,
                 usage: usage,
-                insertionTarget: insertionTarget,
-                successStatus: "\u{2705} Text ready"
+                insertionTarget: autoInsert ? insertionTarget : nil,
+                successStatus: "\u{2705} Text ready",
+                autoInsert: autoInsert
             )
 
             let elapsed = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start)
             Log.info("[STT] done in \(elapsed)s")
             NotificationHelper.clearStatus()
+            return outcome.cleanedText
 
         } catch is CancellationError {
             NotificationHelper.clearStatus()
+            return nil
         } catch {
             Log.error("[STT] error: \(error)")
             NotificationHelper.sendStatus("\u{274C} Failed — recording saved. Retry from menu.")
+            return nil
         }
     }
 
@@ -193,6 +204,9 @@ enum TranscriptionService {
         let transcript = try await transcribeWithRecovery(mode: mode, wavData: wavData, api: api)
         let rawText = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedText = TranscriptPostProcessor.clean(transcript)
+        if rawText != cleanedText {
+            Log.debug("[STT CLEAN] raw=\(preview(rawText)) | cleaned=\(preview(cleanedText))")
+        }
         guard !rawText.isEmpty, !cleanedText.isEmpty else {
                 NotificationHelper.sendStatus("\u{274C} Empty transcription.")
             throw NSError(domain: "GroqTalk.STT", code: -1, userInfo: [
@@ -209,7 +223,8 @@ enum TranscriptionService {
         history: HistoryManager,
         usage: UsageTracker,
         insertionTarget: ClipboardService.InsertionTarget?,
-        successStatus: String
+        successStatus: String,
+        autoInsert: Bool = true
     ) async {
         usage.logUsage(kind: "stt", audioDuration: duration)
 
@@ -220,9 +235,11 @@ enum TranscriptionService {
             structuredTranscript: outcome.transcript.hasTimings ? outcome.transcript : nil
         )
 
-        DictationUndoManager.recordPastedText(outcome.cleanedText)
-        try? await Task.sleep(for: .milliseconds(50))
-        autoPaste(outcome.cleanedText, target: insertionTarget)
+        if autoInsert {
+            DictationUndoManager.recordPastedText(outcome.cleanedText)
+            try? await Task.sleep(for: .milliseconds(50))
+            autoPaste(outcome.cleanedText, target: insertionTarget)
+        }
         NotificationHelper.sendStatus(successStatus, subtitle: String(outcome.cleanedText.prefix(60)))
     }
 
@@ -352,5 +369,11 @@ enum TranscriptionService {
             return
         }
         _ = ClipboardService.insertText(text, target: target)
+    }
+
+    private static func preview(_ text: String, limit: Int = 180) -> String {
+        let compact = text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        guard compact.count > limit else { return compact }
+        return String(compact.prefix(limit)) + "..."
     }
 }

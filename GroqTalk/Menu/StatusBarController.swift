@@ -41,6 +41,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         menu.delegate = self
 
         add("Speech \u{2192} Text  (Fn)", action: #selector(handleRecord))
+        add("Speech \u{2192} Text with Dialog  (Shift+Fn)", action: #selector(handleRecordWithDialog))
         add("Speak Selection  (Ctrl+Option)", action: #selector(handleSpeak))
         add("Live Dictation (Cmd+Shift+Space)", action: #selector(handleLiveDictation))
         add("Delete Last Sentence (Cmd+Shift+Delete)", action: #selector(handleDeleteLastSentence))
@@ -209,29 +210,50 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Custom Dictionary"
-        alert.informativeText = "Add words the STT should recognize (comma-separated).\nExample: Qwen, Groq, Svelte, Tauri"
+        alert.informativeText = """
+        Add STT correction rules, one per line.
+        Use `heard words => desired text` for aliases.
+        Example: quinn ai, coin ai => qwen AI
+        """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        textField.isEditable = true
-        textField.isSelectable = true
-        textField.font = NSFont.systemFont(ofSize: 13)
-        textField.stringValue = ConfigManager.loadDictionary()
-        textField.placeholderString = "Qwen, Groq, Svelte, Tauri"
-        alert.accessoryView = textField
-        alert.window.initialFirstResponder = textField
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 220))
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+
+        let textView = NSTextView(frame: scrollView.bounds)
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        textView.string = ConfigManager.loadDictionary()
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.autoresizingMask = [.width]
+        scrollView.documentView = textView
+
+        alert.accessoryView = scrollView
+        alert.window.initialFirstResponder = textView
         let response = alert.runModal()
         appDelegate?.hotkeys.enableTap()
         guard response == .alertFirstButtonReturn else { return }
-        let words = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        try? words.write(toFile: ConfigManager.dictionaryPath, atomically: true, encoding: .utf8)
-        NotificationHelper.send(title: "GroqTalk", message: "Dictionary saved (\(words.components(separatedBy: ",").count) words)")
+        let words = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try words.write(toFile: ConfigManager.dictionaryPath, atomically: true, encoding: .utf8)
+            let ruleCount = words
+                .components(separatedBy: .newlines)
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .count
+            NotificationHelper.send(title: "GroqTalk", message: "Dictionary saved (\(ruleCount) rules)")
+        } catch {
+            Log.error("[DICTIONARY] failed to save \(ConfigManager.dictionaryPath): \(error)")
+            NotificationHelper.send(title: "GroqTalk", message: "Dictionary save failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Actions
 
     @objc private func handleRecord(_ sender: NSMenuItem) { appDelegate?.toggleRecording() }
+    @objc private func handleRecordWithDialog(_ sender: NSMenuItem) { appDelegate?.toggleRecording(showDialog: true) }
     @objc private func handleSpeak(_ sender: NSMenuItem) { appDelegate?.toggleSpeakSelection() }
     @objc private func handleLiveDictation(_ sender: NSMenuItem) { appDelegate?.toggleLiveDictation() }
     @objc private func handleDeleteLastSentence(_ sender: NSMenuItem) { appDelegate?.deleteLastDictationSentence() }

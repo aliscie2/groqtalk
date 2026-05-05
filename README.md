@@ -1,6 +1,6 @@
 # GroqTalk
 
-Voice-to-text and text-to-speech menubar app for macOS. Local-only. Lives in your menu bar — press Fn to dictate, Ctrl+Option to speak selected text aloud.
+Voice-to-text and text-to-speech menubar app for macOS. Local-only. Lives in your menu bar — press Fn to dictate directly into the focused input, Ctrl+Option to speak selected text aloud.
 
 ## Features
 
@@ -9,9 +9,9 @@ Voice-to-text and text-to-speech menubar app for macOS. Local-only. Lives in you
   - Whisper Large (`mlx-community/whisper-large-v3-turbo-asr-fp16`) as a second accuracy-oriented option
 - **Text-to-speech** via Kokoro (`mlx-community/Kokoro-82M-bf16`) with 9 preset voices. Qwen3 CustomVoice is available as an explicit slow/experimental opt-in, but is hidden from the normal menu by default so it cannot steal resources from live dictation.
 - **Smart chunking** — Apple `NLTagger` sentence segmentation with an atomic-span mask so URLs, numbers, versions, quoted strings, parentheticals, code, and markdown emphasis never get cut mid-word.
-- **Live captions + pause-aware cleanup** — recording shows a floating caption panel and uses structured STT timing for cleaner punctuation/history.
+- **Direct dictation + optional edit dialog** — Fn records with a tiny live preview and inserts into the focused input; Shift+Fn opens the full live/edit dialog for review before insertion.
 - **Searchable history** — search transcripts, add notes, replay entries, and click timed words to hear how you said them.
-- **Hotkeys** — Fn to dictate + auto-paste, Ctrl+Option to read selected text aloud, Cmd+Shift+Space for live dictation, Cmd+Shift+Delete to remove the last dictated sentence.
+- **Hotkeys** — Fn to dictate + auto-paste, Shift+Fn for dialog-assisted dictation, Ctrl+Option to read selected text aloud, Cmd+Shift+Space for live dictation, Cmd+Shift+Delete to remove the last dictated sentence.
 - **Custom dictionary** for domain-specific terms.
 - **100% local** — no cloud, no API keys, no network.
 
@@ -79,7 +79,8 @@ Add domain-specific words/phrases (one per line) to `~/.config/groqtalk/dictiona
 
 | Shortcut | Action |
 |----------|--------|
-| `Fn` (tap) | Toggle recording → transcribe + paste |
+| `Fn` (tap) | Toggle recording → transcribe + paste into the focused input |
+| `Shift+Fn` (tap) | Toggle recording with the live/edit dialog |
 | `Ctrl+Option` (tap) | Read selected text aloud (TTS) |
 | `Cmd+Shift+Space` | Live dictation |
 | `Cmd+Shift+Delete` | Delete the last dictated sentence |

@@ -12,6 +12,9 @@ final class RecentTextPickerPanel {
     static let shared = RecentTextPickerPanel()
 
     var onSelect: ((String) -> Void)?
+    /// Called when the user picks a row but wants to edit it before pasting.
+    /// Invoked via the per-row pencil button or by pressing ⇧⏎.
+    var onOpenInDialog: ((String) -> Void)?
     var onDismiss: (() -> Void)?
 
     var isVisible: Bool { panel?.isVisible == true }
@@ -56,13 +59,13 @@ final class RecentTextPickerPanel {
     }
 
     @discardableResult
-    func handleKey(type: CGEventType, keyCode: CGKeyCode) -> Bool {
+    func handleKey(type: CGEventType, keyCode: CGKeyCode, shift: Bool = false) -> Bool {
         guard isVisible, type == .keyDown else { return false }
 
         if let directIndex = Self.directSelectionIndex(for: keyCode), items.indices.contains(directIndex) {
             selectedIndex = directIndex
             refreshSelection()
-            insertSelected()
+            if shift { openSelectedInDialog() } else { insertSelected() }
             return true
         }
 
@@ -74,7 +77,7 @@ final class RecentTextPickerPanel {
             moveSelection(delta: 1)
             return true
         case Int(kVK_Return), Int(kVK_ANSI_KeypadEnter):
-            insertSelected()
+            if shift { openSelectedInDialog() } else { insertSelected() }
             return true
         case Int(kVK_Escape):
             hide()
@@ -100,6 +103,11 @@ final class RecentTextPickerPanel {
                 self?.selectedIndex = index
                 self?.refreshSelection()
                 self?.insertSelected()
+            }
+            row.onOpenClick = { [weak self] in
+                self?.selectedIndex = index
+                self?.refreshSelection()
+                self?.openSelectedInDialog()
             }
             row.translatesAutoresizingMaskIntoConstraints = false
             row.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
@@ -153,11 +161,21 @@ final class RecentTextPickerPanel {
         onSelect?(text)
     }
 
+    private func openSelectedInDialog() {
+        guard items.indices.contains(selectedIndex) else {
+            hide()
+            return
+        }
+        let text = items[selectedIndex].text
+        hide()
+        onOpenInDialog?(text)
+    }
+
     private func refreshSelection() {
         for (index, row) in rowViews.enumerated() {
             row.isHighlighted = index == selectedIndex
         }
-        hintLabel?.stringValue = "1-\(items.count) insert  •  ↑ ↓ navigate  •  Esc close"
+        hintLabel?.stringValue = "↩︎ insert  •  ⇧↩︎ open in dialog  •  ↑ ↓ navigate  •  Esc close"
     }
 
     private func resizePanel() {
@@ -305,6 +323,7 @@ final class RecentTextPickerPanel {
 
 private final class RecentTextPickerRowView: NSView {
     var onClick: (() -> Void)?
+    var onOpenClick: (() -> Void)?
 
     var isHighlighted = false {
         didSet { updateAppearance() }
@@ -313,6 +332,7 @@ private final class RecentTextPickerRowView: NSView {
     private let badgeLabel = NSTextField(labelWithString: "")
     private let titleLabel: NSTextField
     private let subtitleLabel = NSTextField(labelWithString: "")
+    private let openButton = NSButton()
 
     init(index: Int, item: RecentTextPickerItem) {
         titleLabel = NSTextField(wrappingLabelWithString: item.title)
@@ -334,15 +354,27 @@ private final class RecentTextPickerRowView: NSView {
         titleLabel.textColor = NSColor.labelColor
         titleLabel.maximumNumberOfLines = 2
         titleLabel.lineBreakMode = .byTruncatingTail
-        titleLabel.frame = NSRect(x: 52, y: 24, width: 334, height: 28)
+        titleLabel.frame = NSRect(x: 52, y: 24, width: 296, height: 28)
         addSubview(titleLabel)
 
         subtitleLabel.stringValue = item.subtitle
         subtitleLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         subtitleLabel.textColor = NSColor.secondaryLabelColor
         subtitleLabel.lineBreakMode = .byTruncatingTail
-        subtitleLabel.frame = NSRect(x: 52, y: 10, width: 334, height: 14)
+        subtitleLabel.frame = NSRect(x: 52, y: 10, width: 296, height: 14)
         addSubview(subtitleLabel)
+
+        // Pencil button on the right edge — opens the row's text in the
+        // editable TTS dialog instead of pasting it directly.
+        openButton.bezelStyle = .recessed
+        openButton.title = "✎"
+        openButton.font = NSFont.systemFont(ofSize: 14, weight: .regular)
+        openButton.toolTip = "Open in dialog (⇧⏎)"
+        openButton.frame = NSRect(x: 354, y: 18, width: 36, height: 28)
+        openButton.target = self
+        openButton.action = #selector(handleOpenClick)
+        openButton.refusesFirstResponder = true
+        addSubview(openButton)
 
         updateAppearance()
     }
@@ -353,7 +385,14 @@ private final class RecentTextPickerRowView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // Click anywhere except the open button counts as "insert".
+        let local = convert(event.locationInWindow, from: nil)
+        if openButton.frame.contains(local) { return }
         onClick?()
+    }
+
+    @objc private func handleOpenClick() {
+        onOpenClick?()
     }
 
     private func updateAppearance() {
