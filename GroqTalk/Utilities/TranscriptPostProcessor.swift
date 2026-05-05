@@ -16,6 +16,7 @@ enum TranscriptPostProcessor {
         var cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return "" }
 
+        cleaned = cleaned.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         cleaned = cleaned.replacingOccurrences(
             of: #"\b(?:uh|um|er|ah)\b"#,
             with: "",
@@ -78,19 +79,14 @@ enum TranscriptPostProcessor {
         for index in transcript.sentences.indices {
             let sentence = transcript.sentences[index]
             let nextSentence = transcript.sentences.indices.contains(index + 1) ? transcript.sentences[index + 1] : nil
-            let fromWords = reconstructedSentenceText(sentence, nextSentence: nextSentence)
-
-            if hasSentenceEndingPunctuation(fromWords) {
-                lines.append(fromWords)
+            let sentenceText = sentence.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentenceText.isEmpty {
+                lines.append(appendingTerminalPunctuation(to: sentenceText, sentenceEnd: sentence.end, nextSentence: nextSentence))
                 continue
             }
 
-            let fallback = sentence.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if hasSentenceEndingPunctuation(fallback) {
-                lines.append(fallback)
-            } else {
-                lines.append(appendingTerminalPunctuation(to: fromWords, sentenceEnd: sentence.end, nextSentence: nextSentence))
-            }
+            let fromWords = reconstructedSentenceText(sentence, nextSentence: nextSentence)
+            lines.append(fromWords)
         }
 
         return lines.joined(separator: " ")
@@ -101,8 +97,8 @@ enum TranscriptPostProcessor {
         nextSentence: TranscriptSentence?
     ) -> String {
         guard !sentence.words.isEmpty else {
-            let fallback = sentence.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return appendingTerminalPunctuation(to: fallback, sentenceEnd: sentence.end, nextSentence: nextSentence)
+            let sentenceText = sentence.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return appendingTerminalPunctuation(to: sentenceText, sentenceEnd: sentence.end, nextSentence: nextSentence)
         }
 
         var pieces: [String] = []

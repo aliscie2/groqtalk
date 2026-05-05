@@ -19,16 +19,24 @@ struct ConfigManagerSTTTests {
         }
 
         defaults.removeObject(forKey: key)
-        expect(ConfigManager.defaultSTTMode == .parakeet, "Default STT mode should stay Parakeet for low latency")
-        expect(ConfigManager.selectedSTTMode == .parakeet, "Missing selection should fall back to Parakeet")
+        let expectedDefault: ConfigManager.STTMode = ConfigManager.isSTTModeSelectable(.whisperLarge)
+            ? .whisperLarge
+            : .parakeet
+        expect(ConfigManager.defaultSTTMode == expectedDefault, "Default STT mode should prefer Whisper Large when available")
+        expect(ConfigManager.selectedSTTMode == expectedDefault, "Missing selection should fall back to the preferred available STT mode")
 
         defaults.set("not-a-real-mode", forKey: key)
-        expect(ConfigManager.selectedSTTMode == .parakeet, "Invalid selection should fall back to Parakeet")
+        expect(ConfigManager.selectedSTTMode == expectedDefault, "Invalid selection should fall back to the preferred available STT mode")
 
         defaults.set(ConfigManager.STTMode.whisperLarge.rawValue, forKey: key)
         if !ConfigManager.isSTTModeSelectable(.whisperLarge) {
-            expect(ConfigManager.selectedSTTMode == .parakeet, "Unavailable Whisper Large should fall back to Parakeet")
+            expect(ConfigManager.selectedSTTMode == expectedDefault, "Unavailable Whisper Large should fall back to the preferred available STT mode")
         }
+
+        let prompt = ConfigManager.sttInitialPrompt()
+        expect(prompt.contains("mesh LLM"), "STT prompt should bias acronym-heavy project terms")
+        expect(prompt.contains("Petra Cursor"), "STT prompt should include multi-word software terms")
+        expect(prompt.contains("Tauri app"), "STT prompt should bias app phrasing")
 
         print("ConfigManager STT tests passed")
     }

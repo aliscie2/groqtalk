@@ -125,7 +125,7 @@ final class GroqAPIClient: @unchecked Sendable {
             ("response_format", verbose ? "verbose_json" : "json"),
             ("temperature", "0.0"),
         ]
-        let prompt = ConfigManager.loadDictionary()
+        let prompt = ConfigManager.sttInitialPrompt()
         if !prompt.isEmpty {
             fields.append(("prompt", prompt))
         }

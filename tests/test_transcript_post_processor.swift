@@ -1,5 +1,19 @@
 import Foundation
 
+struct ConfigManager {
+    struct DictionaryEntry {
+        let canonical: String
+        let aliases: [String]
+    }
+
+    static func dictionaryEntries() -> [DictionaryEntry] {
+        [
+            DictionaryEntry(canonical: "qwen", aliases: ["quan"]),
+            DictionaryEntry(canonical: "tauri", aliases: ["ta uri"]),
+        ]
+    }
+}
+
 func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() { fatalError(message) }
 }
@@ -16,6 +30,7 @@ struct TranscriptPostProcessorTests {
             ("desktop forward slash custom-tools slash groqtalk", "desktop/custom-tools/groqtalk"),
             ("users backslash ali", "users\\ali"),
             ("slash is still a word here", "slash is still a word here"),
+            ("Ta\nuri app", "tauri app"),
         ]
 
         for (input, expected) in cases {
@@ -56,6 +71,33 @@ struct TranscriptPostProcessorTests {
         expect(
             structuredCleaned == "should we rebuild? should we put it on applications again?",
             "Expected structured punctuation cleanup, got `\(structuredCleaned)`"
+        )
+
+        let textAuthoritative = StructuredTranscript(
+            text: "Mesh is running Quan and Quan is doing the heavy judging.",
+            sentences: [
+                TranscriptSentence(
+                    text: "Mesh is running Quan and Quan is doing the heavy judging.",
+                    start: 0.0,
+                    end: 4.0,
+                    words: [
+                        TranscriptWord(text: "Mesh", start: 0.0, end: 0.2),
+                        TranscriptWord(text: "is", start: 0.2, end: 0.4),
+                        TranscriptWord(text: "runningQuan", start: 0.4, end: 1.0),
+                        TranscriptWord(text: "andQuan", start: 1.2, end: 1.8),
+                        TranscriptWord(text: "is", start: 1.9, end: 2.1),
+                        TranscriptWord(text: "doing", start: 2.1, end: 2.4),
+                        TranscriptWord(text: "the", start: 2.4, end: 2.6),
+                        TranscriptWord(text: "heavy", start: 2.6, end: 3.0),
+                        TranscriptWord(text: "judging.", start: 3.0, end: 4.0),
+                    ]
+                ),
+            ]
+        )
+        let authoritativeCleaned = TranscriptPostProcessor.clean(textAuthoritative)
+        expect(
+            authoritativeCleaned == "Mesh is running qwen and qwen is doing the heavy judging.",
+            "Expected sentence text to remain authoritative over glued timing words, got `\(authoritativeCleaned)`"
         )
 
         print("TranscriptPostProcessor tests passed")

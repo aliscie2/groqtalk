@@ -1,0 +1,16 @@
+{
+  "fixture": "mesh_llm_tauri_app",
+  "wavPath": "tests/fixtures/stt/mesh_llm_tauri_app.wav",
+  "expectedText": "Test mesh LLM, now I'm talking with Petra Cursor, Tauri app.",
+  "baselineText": "Test test mash alarm now I'm talking with Petra Curzi tori up",
+  "guidedText": "Test, test, mesh LLM, now I'm talking with Petra Cursor, Tauri app.",
+  "baselineEditRatio": 0.2807017543859649,
+  "guidedEditRatio": 0.08771929824561403,
+  "requiredPhrases": [
+    "mesh LLM",
+    "Petra Cursor",
+    "Tauri app"
+  ],
+  "prompt": "The speaker discusses software development. Correct terms include mesh LLM, LLM, Petra Cursor, Cursor, Tauri app, GroqTalk, Qwen, AI, PDF, VPN, KYC, DHL, Shopify, Hyderabad, Coimbatore, Test, I, Tauri. Preserve acronyms and app names.",
+  "videoPath": "/Users/ali/Desktop/custom-tools/groqtalk/artifacts/stt-lab/mesh_llm_tauri_app/mesh_llm_tauri_app.mp4"
+}

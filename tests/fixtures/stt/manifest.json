@@ -1,0 +1,16 @@
+{
+  "fixtures": [
+    {
+      "name": "mesh_llm_tauri_app",
+      "wavPath": "tests/fixtures/stt/mesh_llm_tauri_app.wav",
+      "mode": "whisperLarge",
+      "expectedText": "Test mesh LLM, now I'm talking with Petra Cursor, Tauri app.",
+      "requiredPhrases": [
+        "mesh LLM",
+        "Petra Cursor",
+        "Tauri app"
+      ],
+      "maxEditDistanceRatio": 0.12
+    }
+  ]
+}

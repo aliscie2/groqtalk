@@ -22,13 +22,14 @@ struct ConfigManager {
     ]
     static let parakeetModel = sttModelID[.parakeet]!
 
-    /// Parakeet is the low-latency default in the current local stack.
-    /// Whisper Small / Large run on dedicated whisper.cpp daemons.
+    /// Whisper Large is preferred when present because direct dictation should
+    /// optimize for recognition quality. Parakeet remains the always-available
+    /// low-latency fallback.
     enum STTMode: String { case parakeet, whisperSmall, whisperLarge }
     static let sttModels: [(mode: STTMode, label: String, path: String)] = [
-        (.parakeet, "Parakeet", ""),
+        (.whisperLarge, "Whisper Large (more accurate)", whisperLargePath),
         (.whisperSmall, "Whisper Small", whisperSmallPath),
-        (.whisperLarge, "Whisper Large", whisperLargePath),
+        (.parakeet, "Parakeet (fast)", ""),
     ]
     static var availableSTTModels: [(mode: STTMode, label: String, path: String)] {
         sttModels.filter { isSTTModeSelectable($0.mode) }
@@ -38,7 +39,7 @@ struct ConfigManager {
     static let systemRAMGB: Int = Int(systemRAM / (1024 * 1024 * 1024))
 
     static var defaultSTTMode: STTMode {
-        .parakeet
+        isSTTModeSelectable(.whisperLarge) ? .whisperLarge : .parakeet
     }
 
     private static let selectedSTTModeKey = "selectedSTTMode"
@@ -300,6 +301,18 @@ struct ConfigManager {
         return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static func sttInitialPrompt() -> String {
+        let builtInTerms = [
+            "mesh LLM", "LLM", "Petra Cursor", "Cursor", "Tauri app",
+            "GroqTalk", "Qwen", "AI", "PDF", "VPN", "KYC", "DHL", "Shopify",
+            "Hyderabad", "Coimbatore"
+        ]
+        let dictionaryTerms = dictionaryEntries().map(\.canonical)
+        let terms = uniqueTerms(builtInTerms + dictionaryTerms)
+        guard !terms.isEmpty else { return "" }
+        return "The speaker discusses software development. Correct terms include \(terms.joined(separator: ", ")). Preserve acronyms and app names."
+    }
+
     struct DictionaryEntry {
         let canonical: String
         let aliases: [String]
@@ -329,6 +342,20 @@ struct ConfigManager {
                     .filter { !$0.isEmpty }
                     .map { DictionaryEntry(canonical: $0, aliases: []) }
             }
+    }
+
+    private static func uniqueTerms(_ terms: [String]) -> [String] {
+        var seen = Set<String>()
+        var output: [String] = []
+        for term in terms {
+            let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let key = trimmed.lowercased()
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            output.append(trimmed)
+        }
+        return output
     }
 
     static let silenceThreshold: Float = 0.005
